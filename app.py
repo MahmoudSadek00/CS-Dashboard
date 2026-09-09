@@ -199,6 +199,7 @@ chats_df = result['chats']
 calls_df = result['calls']
 adherence_df = result['adherence']
 unclassified = result['unclassified_shifts']
+daily_audit = result['daily_audit']
 unmatched_ids = result['unmatched_chat_ids']
 unattributed_calls = result['unattributed_calls']
 chat_category_totals = result['chat_category_totals']
@@ -236,7 +237,22 @@ c5, c6, c7, c8 = st.columns(4)
 c5.metric("Dropped Rate", _pct(overall['dropped_rate']), help="Dropped calls as a share of ALL calls in the period.")
 c6.metric("Abandoned Rate", _pct(overall['abandoned_rate']), help="Abandoned calls as a share of ALL calls in the period.")
 c7.metric("Avg. Adherence", _pct(overall['avg_adherence']))
-c8.metric("Avg. Occupancy", _pct(overall['avg_occupancy']), help="Calls-only metric: Busy time / (Busy + Online) time. Chat handling shows as Online, same as idle time, so this will always read low.")
+with c8:
+    st.metric(
+        "Avg. Occupancy", _pct(overall['avg_occupancy']),
+        help="(Busy call time + chat-handling time) / (Available + Busy) time, averaged "
+             "across agents. Click below for the calls-vs-chats split.",
+    )
+    with st.popover("Calls vs. chats split"):
+        if overall['occupancy_calls_pct'] is None:
+            st.caption("No occupied time (calls or chats) in this period.")
+        else:
+            st.write(f"📞 Calls: **{overall['occupancy_calls_pct']:.1f}%** "
+                     f"({overall['occupancy_calls_min']:,.0f} min)")
+            st.write(f"💬 Chats: **{overall['occupancy_chat_pct']:.1f}%** "
+                     f"({overall['occupancy_chat_min']:,.0f} min)")
+            st.caption("Share of the combined Busy-calls + chat-handling minutes behind "
+                       "the Occupancy % above (company-wide, this period).")
 
 c9, c10, _c11, _c12 = st.columns(4)
 c9.metric("Avg. Shrinkage", _pct(overall['avg_shrinkage']))
@@ -537,7 +553,7 @@ if comparison is not None:
 # Diagnostics -- data-quality notes, not hidden away
 # ---------------------------------------------------------------------------
 st.header("Diagnostics")
-d1, d2, d3 = st.columns(3)
+d1, d2, d3, d4 = st.columns(4)
 with d1:
     st.subheader("Unclassified shift days")
     st.caption('"Task" / "Task - Normal Shift" -- meaning still unconfirmed, excluded from Adherence.')
@@ -557,3 +573,13 @@ with d3:
     st.caption("Included in the Overall cards/chart above, but can't appear in the per-agent Calls table -- "
                "there's no Agent value to attribute them to (almost all Dropped calls are like this by nature).")
     st.metric("Unattributed calls", f"{unattributed_calls:,}")
+with d4:
+    st.subheader("Fri/Sat/Sun WFH override")
+    st.caption('Any working shift on Friday/Saturday/Sunday is treated as WFH regardless of the '
+               'sheet\'s "Is WFH" value -- rows below are the ones where the sheet actually said '
+               'something else (blank or "No") and got overridden.')
+    wfh_overrides = daily_audit[daily_audit.get('WFH Overridden', False) == True] if not daily_audit.empty else daily_audit
+    if wfh_overrides.empty:
+        st.caption("None in this period.")
+    else:
+        st.dataframe(wfh_overrides[['Agent', 'Date', 'Shift']], use_container_width=True, hide_index=True)
