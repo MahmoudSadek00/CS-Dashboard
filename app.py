@@ -297,11 +297,64 @@ if not selected_agents:
     selected_agents = all_agents
 
 # ---------------------------------------------------------------------------
+# Currency -- per-market "local currency units per $1 USD" rates, entered by
+# hand. Ops Pulse itself never converts currency (checked -- no rate table in
+# its own exports), so there's no existing method to inherit; rates move day to
+# day, so this app never fetches or guesses one on its own. Leave a market at 0
+# to skip converting it -- its orders just stay out of the USD columns.
+# ---------------------------------------------------------------------------
+FX_MARKETS = [
+    ('IQ', 'Iraq (IQD)'),
+    ('SA', 'Saudi Arabia (SAR)'),
+    ('UAE', 'UAE (AED)'),
+    ('KW', 'Kuwait (KWD)'),
+    ('OM', 'Oman (OMR)'),
+    ('QA', 'Qatar (QAR)'),
+    ('BH', 'Bahrain (BHD)'),
+]
+with st.sidebar:
+    st.divider()
+    st.header("Currency (AOV → USD)")
+    with st.expander("Set exchange rates", expanded=False):
+        st.caption(
+            "Local currency units = $1 USD, for the AOV per Agent section below. Leave a "
+            "market at 0 to leave its orders unconverted (shown in local currency only). "
+            "Reference only (not pre-filled, rates move): as of Sep 9, 2026, IQD official "
+            "CBI rate ≈ 1,310, parallel market ≈ 1,560 per $1."
+        )
+        fx_rates = {}
+        for code, label in FX_MARKETS:
+            rate = st.number_input(label, min_value=0.0, value=0.0, step=0.01, format="%.4f", key=f"fx_{code}")
+            if rate:
+                fx_rates[code] = rate
+
+# ---------------------------------------------------------------------------
+# AOV per agent data -- fetched once here (before Export, which needs it) and
+# rendered further down the page. From the SEPARATE "Orders Clean" spreadsheet's
+# Orders tab, Salesman column (last column: either "Created by customer" or an
+# agent's name -- only the agent-name rows count). Own try/except since this is
+# a different sheet that may not be shared with the service account yet.
+# ---------------------------------------------------------------------------
+aov_df = aov_diag = aov_error = None
+try:
+    orders_df = _cached_orders_df(gc, CLEAN_SHEET_ID, CLEAN_SHEET_ORDERS_TAB, st.session_state['cache_bump'])
+    aov_df, aov_diag = logic.compute_aov_by_agent(orders_df, pd.Timestamp(start), pd.Timestamp(end), fx_rates=fx_rates)
+except Exception as e:
+    aov_error = (
+        f"Couldn't read the Orders (Clean) sheet: {e}\n\nMost likely cause: the service "
+        "account isn't shared as a Viewer on this specific sheet yet -- see the README."
+    )
+
+# ---------------------------------------------------------------------------
 # Export -- whole report or a hand-picked set of sections, as one .xlsx with a
 # sheet per section. Always exports the FULL agent roster (not narrowed by the
 # Agents filter above) so the downloaded file reads as a complete report.
 # ---------------------------------------------------------------------------
-EXPORT_SECTIONS = ['Overall', 'Chats', 'Calls', 'Adherence'] + (['Comparison'] if comparison is not None else [])
+EXPORT_SECTIONS = (
+    ['Overall', 'Chats', 'Calls', 'Adherence']
+    + (['AOV'] if aov_df is not None and not aov_df.empty else [])
+    + (['Comparison'] if comparison is not None else [])
+)
 with st.sidebar:
     st.divider()
     st.header("Export")
@@ -309,7 +362,16 @@ with st.sidebar:
         "Sections to include", options=EXPORT_SECTIONS, default=EXPORT_SECTIONS,
         help="Leave everything selected for the whole report, or pick just the section(s) you need.",
     )
-    export_bytes = logic.export_excel(result, comparison=comparison, sections=export_sections) if export_sections else None
+    period_label = f"{start:%Y-%m-%d} → {end:%Y-%m-%d}"
+    currency_note = (
+        "AOV converted to USD using: " + ", ".join(f"{k}={v:g}" for k, v in fx_rates.items())
+        if fx_rates else "AOV not converted to USD (no rate set)"
+    )
+    export_bytes = logic.export_excel(
+        result, comparison=comparison, sections=export_sections,
+        aov_df=aov_df if 'AOV' in export_sections else None,
+        period_label=period_label, currency_note=currency_note,
+    ) if export_sections else None
     st.download_button(
         "⬇️ Download report (.xlsx)", data=export_bytes or b"",
         file_name=f"cs_pulse_{start:%Y%m%d}_to_{end:%Y%m%d}.xlsx",
@@ -374,41 +436,45 @@ else:
     )
 
 # ---------------------------------------------------------------------------
-# AOV per agent -- from the SEPARATE "Orders Clean" spreadsheet's Orders tab,
-# Salesman column (last column: either "Created by customer" or an agent's name --
-# only the agent-name rows count here). Own try/except since this is a different
-# sheet that may not be shared with the service account yet.
+# AOV per agent -- rendering only; aov_df/aov_diag/aov_error were fetched
+# earlier (before Export, which also needs them) using the Currency rates set
+# in the sidebar above.
 # ---------------------------------------------------------------------------
 st.header("AOV per Agent")
 st.caption(
     "From the Orders (Clean) sheet's \"Salesman\" column -- orders created by the customer "
     "themselves are excluded, only orders attributed to an agent's own sales count."
 )
-st.warning(
-    "⚠️ These AOV figures are in the Orders sheet's original currency, as-is -- **not** "
-    "converted to USD. The CEO scorecard's AOV target is in USD ($90-130, market-dependent), "
-    "so these numbers aren't directly comparable to that target yet without an FX rate table.",
-    icon="⚠️",
-)
-try:
-    orders_df = _cached_orders_df(gc, CLEAN_SHEET_ID, CLEAN_SHEET_ORDERS_TAB, st.session_state['cache_bump'])
-    aov_df, aov_diag = logic.compute_aov_by_agent(orders_df, pd.Timestamp(start), pd.Timestamp(end))
+if aov_error:
+    st.info(aov_error)
+elif aov_df is None:
+    st.caption("Couldn't compute AOV for this period.")
+elif aov_df.empty:
+    st.caption("No agent-attributed orders matched the roster in this period.")
+else:
+    has_usd = 'AOV (USD)' in aov_df.columns
+    if not fx_rates:
+        st.warning(
+            "⚠️ No exchange rate set -- these AOV figures are shown in the Orders sheet's "
+            "original currency, as-is, not converted to USD. Set a rate per market in the "
+            "**Currency (AOV → USD)** section of the sidebar to compare against the CEO "
+            "scorecard's AOV target ($90-130, market-dependent).",
+            icon="⚠️",
+        )
+    else:
+        st.caption(
+            "AOV (USD) columns use the rate(s) set in the sidebar's **Currency (AOV → USD)** "
+            "section. Orders in a market without a rate set stay out of those columns (shown "
+            "in the Orders/AOV/Total Value columns in local currency only)."
+        )
     if aov_diag:
         st.info(aov_diag)
-    elif aov_df.empty:
-        st.caption("No agent-attributed orders matched the roster in this period.")
-    else:
-        aov_df_view = aov_df[aov_df['Agent'].isin(selected_agents)].reset_index(drop=True)
-        st.dataframe(
-            aov_df_view, use_container_width=True, hide_index=True,
-            column_config={'AOV': st.column_config.NumberColumn(format="%.2f")},
-        )
-except Exception as e:
-    st.info(
-        f"Couldn't read the Orders (Clean) sheet: {e}\n\nMost likely cause: the service "
-        "account isn't shared as a Viewer on this specific sheet yet -- see the README."
-    )
-    aov_df = None
+    aov_df_view = aov_df[aov_df['Agent'].isin(selected_agents)].reset_index(drop=True)
+    col_config = {'AOV': st.column_config.NumberColumn(format="%.2f")}
+    if has_usd:
+        col_config['AOV (USD)'] = st.column_config.NumberColumn(format="$%.2f")
+        col_config['Total Value (USD)'] = st.column_config.NumberColumn(format="$%.2f")
+    st.dataframe(aov_df_view, use_container_width=True, hide_index=True, column_config=col_config)
 
 # ---------------------------------------------------------------------------
 # Comparison -- Period A vs Period B, same concept as the Ops Pulse comparison
