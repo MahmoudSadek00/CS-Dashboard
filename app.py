@@ -71,6 +71,12 @@ def _pct(v):
 # ---------------------------------------------------------------------------
 DEFAULT_SPREADSHEET_ID = '1Lz9OaWLpEM-m9w-5bxITTPKs9e00ZfuGtCl3m1Iicpw'
 
+# The Orders "Clean" sheet AOV is pulled from -- a DIFFERENT spreadsheet from the CS
+# sheet above, per Mahmoud (Sep 2026). Needs its own Viewer share for the same service
+# account -- see the README. Tab is "Orders", last column "Salesman".
+CLEAN_SHEET_ID = '1dZMqtqvnxe6GspH0C10AvXECB74NP-ZjDG_BihMOkmg'
+CLEAN_SHEET_ORDERS_TAB = 'Orders'
+
 
 def _load_creds_info():
     try:
@@ -91,7 +97,8 @@ with st.sidebar:
     if not creds_info:
         st.error("No Google credential configured on this deployment -- see the README.")
         st.stop()
-    spreadsheet_id = st.text_input("Spreadsheet ID", value=DEFAULT_SPREADSHEET_ID)
+    with st.expander("Advanced (data source)"):
+        spreadsheet_id = st.text_input("Spreadsheet ID", value=DEFAULT_SPREADSHEET_ID)
     if 'cache_bump' not in st.session_state:
         st.session_state['cache_bump'] = 0
     if st.button("🔄 Refresh from Google Sheets"):
@@ -102,34 +109,39 @@ with st.sidebar:
     st.header("Period")
     default_start = dt.date(2026, 7, 1)
     default_end = dt.date(2026, 8, 31)
-    date_range = st.date_input("Date range", value=(default_start, default_end))
+
+    period_mode = st.radio(
+        "Mode", ["Single period", "Compare two periods"], index=0,
+        help="\"Compare two periods\" is the same concept as the Ops Pulse comparison report -- "
+             "pick Period A and Period B, see every metric side by side with a delta, company-wide "
+             "and per agent. The dashboard below always reflects Period B (or the single period).",
+    )
+    enable_comparison = period_mode == "Compare two periods"
+    range_a = range_b = None
+
+    if not enable_comparison:
+        start = st.date_input("Start date", value=default_start, key="single_start")
+        end = st.date_input("End date", value=default_end, key="single_end")
+    else:
+        period_len = (default_end - default_start).days + 1
+        default_a_end = default_start - dt.timedelta(days=1)
+        default_a_start = default_a_end - dt.timedelta(days=period_len - 1)
+        st.caption("Period B is the main period this dashboard shows below; Period A defaults to "
+                   "the same-length period right before it -- all four dates are editable.")
+        a_start = st.date_input("Period A start", value=default_a_start, key="a_start")
+        a_end = st.date_input("Period A end", value=default_a_end, key="a_end")
+        b_start = st.date_input("Period B start", value=default_start, key="b_start")
+        b_end = st.date_input("Period B end", value=default_end, key="b_end")
+        range_a = (a_start, a_end)
+        range_b = (b_start, b_end)
+        start, end = b_start, b_end
+
     st.divider()
     st.caption("Bahrain team is always excluded from this report.")
 
-if isinstance(date_range, tuple) and len(date_range) == 2:
-    start, end = date_range
-else:
-    st.warning("Pick a full date range (start and end).")
+if not (isinstance(start, dt.date) and isinstance(end, dt.date)) or start > end:
+    st.warning("Pick a valid date range (start on or before end).")
     st.stop()
-
-with st.sidebar:
-    st.divider()
-    st.header("Comparison")
-    enable_comparison = st.checkbox(
-        "Compare two periods", value=False,
-        help="Same concept as the Ops Pulse comparison report -- pick Period A and Period B, "
-             "see every metric side by side with a delta, company-wide and per agent.",
-    )
-    range_a = range_b = None
-    if enable_comparison:
-        period_len = (end - start).days + 1
-        default_b_start, default_b_end = start, end
-        default_a_end = start - dt.timedelta(days=1)
-        default_a_start = default_a_end - dt.timedelta(days=period_len - 1)
-        st.caption("Period B defaults to the main date range above; Period A defaults to the "
-                   "same-length period right before it -- both are editable.")
-        range_a = st.date_input("Period A", value=(default_a_start, default_a_end), key="period_a")
-        range_b = st.date_input("Period B", value=(default_b_start, default_b_end), key="period_b")
 
 
 @st.cache_resource(show_spinner=False)
@@ -143,6 +155,11 @@ def _cached_sheet_report(_gc, spreadsheet_id, start, end, cache_bump):
     # (no underscore) IS part of the cache key, so the sidebar Refresh button forces
     # a fresh read even before the 600s TTL expires.
     return logic.build_report_from_sheet(_gc, spreadsheet_id, start, end)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_orders_df(_gc, spreadsheet_id, tab_name, cache_bump):
+    return logic.load_orders_clean(_gc, spreadsheet_id, tab_name)
 
 
 if not spreadsheet_id:
@@ -164,18 +181,16 @@ with st.spinner("Reading the live sheet and crunching the numbers..."):
 
 comparison = None
 if enable_comparison:
-    valid_a = isinstance(range_a, tuple) and len(range_a) == 2
-    valid_b = isinstance(range_b, tuple) and len(range_b) == 2
-    if not (valid_a and valid_b):
-        st.sidebar.warning("Pick a full date range for both Period A and Period B to see the comparison.")
+    start_a, end_a = range_a
+    if start_a > end_a:
+        st.sidebar.warning("Pick a valid Period A (start on or before end) to see the comparison.")
     else:
-        start_a, end_a = range_a
-        start_b, end_b = range_b
-        with st.spinner("Building the comparison (reading both periods)..."):
+        # Period B is exactly the main `start`/`end` above, so `result` (already fetched)
+        # IS report_b -- no need to fetch it a second time, just fetch Period A.
+        with st.spinner("Building the comparison (reading Period A)..."):
             try:
                 report_a = _cached_sheet_report(gc, spreadsheet_id, pd.Timestamp(start_a), pd.Timestamp(end_a), st.session_state['cache_bump'])
-                report_b = _cached_sheet_report(gc, spreadsheet_id, pd.Timestamp(start_b), pd.Timestamp(end_b), st.session_state['cache_bump'])
-                comparison = logic.build_comparison(report_a, report_b)
+                comparison = logic.build_comparison(report_a, result)
             except Exception as e:
                 st.warning(f"Couldn't build the comparison: {e}")
 
@@ -193,27 +208,50 @@ chat_category_totals = result['chat_category_totals']
 # ---------------------------------------------------------------------------
 st.header("Overall")
 
+def _badge_delta(value, key):
+    # st.metric's delta only accepts a short string, and we don't want the usual
+    # green-up/red-down arrow semantics (this isn't a "change" value) -- delta_color="off"
+    # renders it as plain grey text next to the number instead.
+    return logic.target_badge(value, key)
+
+
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Chats Closed", f"{overall['total_chats_closed']:,}")
-c2.metric("Chats FCR Rate", _pct(overall['fcr_rate']), help="No return contact from the same customer within 7 days of the chat closing.")
+c2.metric(
+    "Chats FCR Rate", _pct(overall['fcr_rate']),
+    delta=_badge_delta(overall['fcr_rate'], 'fcr_rate'), delta_color="off",
+    help="No return contact from the same customer within 7 days of the chat closing. "
+         "Badge shows this against the CEO Q3 2026 scorecard target (90%).",
+)
 c3.metric("Total Calls", f"{overall['total_calls']:,}")
 c4.metric(
     "Calls Answered Rate", _pct(overall['answered_rate']),
+    delta=_badge_delta(overall['answered_rate'], 'answered_rate'), delta_color="off",
     help="Serviced, as a share of ALL calls in the period -- including calls that never reached any agent "
-         "(e.g. Dropped), which is why this is computed against the full Calls tab rather than the per-agent table.",
+         "(e.g. Dropped), which is why this is computed against the full Calls tab rather than the per-agent table. "
+         "Badge shows this against the CEO Q3 2026 scorecard target (95%, stretch 98%).",
 )
 
 c5, c6, c7, c8 = st.columns(4)
-c5.metric("Avg. Adherence", _pct(overall['avg_adherence']))
-c6.metric("Avg. Occupancy", _pct(overall['avg_occupancy']), help="Calls-only metric: Busy time / (Busy + Online) time. Chat handling shows as Online, same as idle time, so this will always read low.")
-c7.metric("Avg. Shrinkage", _pct(overall['avg_shrinkage']))
-c8.metric("Agents in Scope", f"{overall['agents_in_scope']}")
+c5.metric("Dropped Rate", _pct(overall['dropped_rate']), help="Dropped calls as a share of ALL calls in the period.")
+c6.metric("Abandoned Rate", _pct(overall['abandoned_rate']), help="Abandoned calls as a share of ALL calls in the period.")
+c7.metric("Avg. Adherence", _pct(overall['avg_adherence']))
+c8.metric("Avg. Occupancy", _pct(overall['avg_occupancy']), help="Calls-only metric: Busy time / (Busy + Online) time. Chat handling shows as Online, same as idle time, so this will always read low.")
+
+c9, c10, _c11, _c12 = st.columns(4)
+c9.metric("Avg. Shrinkage", _pct(overall['avg_shrinkage']))
+c10.metric("Agents in Scope", f"{overall['agents_in_scope']}")
 
 st.subheader("Calls by state")
 state_totals = overall['call_state_totals']
+state_total_n = sum(state_totals.values())
+state_labels = [
+    f"{v:,} ({v / state_total_n * 100:.1f}%)" if state_total_n else f"{v:,}"
+    for v in state_totals.values()
+]
 fig = go.Figure(go.Bar(
     x=list(state_totals.values()), y=list(state_totals.keys()), orientation='h',
-    marker_color=[STATE_COLORS[s] for s in state_totals], text=[f"{v:,}" for v in state_totals.values()],
+    marker_color=[STATE_COLORS[s] for s in state_totals], text=state_labels,
     textposition='outside', hovertemplate='%{y}: %{x:,}<extra></extra>',
 ))
 fig.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Calls", yaxis_title=None)
@@ -224,9 +262,14 @@ st.plotly_chart(fig, use_container_width=True)
 if chat_category_totals:
     st.subheader("Chats by category")
     cats = dict(sorted(chat_category_totals.items(), key=lambda kv: kv[1]))
+    cat_total_n = sum(cats.values())
+    cat_labels = [
+        f"{v:,} ({v / cat_total_n * 100:.1f}%)" if cat_total_n else f"{v:,}"
+        for v in cats.values()
+    ]
     fig_cat = go.Figure(go.Bar(
         x=list(cats.values()), y=list(cats.keys()), orientation='h',
-        marker_color='#5B8DEF', text=[f"{v:,}" for v in cats.values()],
+        marker_color='#5B8DEF', text=cat_labels,
         textposition='outside', hovertemplate='%{y}: %{x:,}<extra></extra>',
     ))
     fig_cat.update_layout(height=max(220, 28 * len(cats)), margin=dict(l=10, r=10, t=10, b=10),
@@ -252,6 +295,27 @@ if sel_all:
 if not selected_agents:
     st.warning("No agents selected in the sidebar -- pick at least one to see the tables below.")
     selected_agents = all_agents
+
+# ---------------------------------------------------------------------------
+# Export -- whole report or a hand-picked set of sections, as one .xlsx with a
+# sheet per section. Always exports the FULL agent roster (not narrowed by the
+# Agents filter above) so the downloaded file reads as a complete report.
+# ---------------------------------------------------------------------------
+EXPORT_SECTIONS = ['Overall', 'Chats', 'Calls', 'Adherence'] + (['Comparison'] if comparison is not None else [])
+with st.sidebar:
+    st.divider()
+    st.header("Export")
+    export_sections = st.multiselect(
+        "Sections to include", options=EXPORT_SECTIONS, default=EXPORT_SECTIONS,
+        help="Leave everything selected for the whole report, or pick just the section(s) you need.",
+    )
+    export_bytes = logic.export_excel(result, comparison=comparison, sections=export_sections) if export_sections else None
+    st.download_button(
+        "⬇️ Download report (.xlsx)", data=export_bytes or b"",
+        file_name=f"cs_pulse_{start:%Y%m%d}_to_{end:%Y%m%d}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        disabled=not export_sections, use_container_width=True,
+    )
 
 
 def _filter_agents(df):
@@ -308,6 +372,43 @@ else:
             'Shrinkage %': st.column_config.NumberColumn(format="%.1f%%"),
         },
     )
+
+# ---------------------------------------------------------------------------
+# AOV per agent -- from the SEPARATE "Orders Clean" spreadsheet's Orders tab,
+# Salesman column (last column: either "Created by customer" or an agent's name --
+# only the agent-name rows count here). Own try/except since this is a different
+# sheet that may not be shared with the service account yet.
+# ---------------------------------------------------------------------------
+st.header("AOV per Agent")
+st.caption(
+    "From the Orders (Clean) sheet's \"Salesman\" column -- orders created by the customer "
+    "themselves are excluded, only orders attributed to an agent's own sales count."
+)
+st.warning(
+    "⚠️ These AOV figures are in the Orders sheet's original currency, as-is -- **not** "
+    "converted to USD. The CEO scorecard's AOV target is in USD ($90-130, market-dependent), "
+    "so these numbers aren't directly comparable to that target yet without an FX rate table.",
+    icon="⚠️",
+)
+try:
+    orders_df = _cached_orders_df(gc, CLEAN_SHEET_ID, CLEAN_SHEET_ORDERS_TAB, st.session_state['cache_bump'])
+    aov_df, aov_diag = logic.compute_aov_by_agent(orders_df, pd.Timestamp(start), pd.Timestamp(end))
+    if aov_diag:
+        st.info(aov_diag)
+    elif aov_df.empty:
+        st.caption("No agent-attributed orders matched the roster in this period.")
+    else:
+        aov_df_view = aov_df[aov_df['Agent'].isin(selected_agents)].reset_index(drop=True)
+        st.dataframe(
+            aov_df_view, use_container_width=True, hide_index=True,
+            column_config={'AOV': st.column_config.NumberColumn(format="%.2f")},
+        )
+except Exception as e:
+    st.info(
+        f"Couldn't read the Orders (Clean) sheet: {e}\n\nMost likely cause: the service "
+        "account isn't shared as a Viewer on this specific sheet yet -- see the README."
+    )
+    aov_df = None
 
 # ---------------------------------------------------------------------------
 # Comparison -- Period A vs Period B, same concept as the Ops Pulse comparison
