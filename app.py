@@ -297,36 +297,46 @@ if not selected_agents:
     selected_agents = all_agents
 
 # ---------------------------------------------------------------------------
-# Currency -- per-market "local currency units per $1 USD" rates, entered by
-# hand. Ops Pulse itself never converts currency (checked -- no rate table in
-# its own exports), so there's no existing method to inherit; rates move day to
-# day, so this app never fetches or guesses one on its own. Leave a market at 0
-# to skip converting it -- its orders just stay out of the USD columns.
+# Currency -- for the AOV per Agent section below. Per Mahmoud, GC's markets
+# settle in one of three currencies, not one-per-country: UAE and Oman orders
+# are both in AED; Saudi, Kuwait and Qatar orders are all in BHD; Iraq is its
+# own IQD. So this is three rate fields, not seven -- entered by hand (Ops
+# Pulse itself never converts currency anywhere in its own exports, so there's
+# no existing method to inherit, and rates move day to day so this app never
+# fetches or guesses one on its own). AED and BHD are both long-standing hard
+# pegs to the dollar (unchanged for decades), so their defaults below are safe
+# to leave as-is; IQD drifts, so that one is worth checking periodically --
+# these are starting defaults only, not live rates, and always editable.
 # ---------------------------------------------------------------------------
-FX_MARKETS = [
-    ('IQ', 'Iraq (IQD)'),
-    ('SA', 'Saudi Arabia (SAR)'),
-    ('UAE', 'UAE (AED)'),
-    ('KW', 'Kuwait (KWD)'),
-    ('OM', 'Oman (OMR)'),
-    ('QA', 'Qatar (QAR)'),
-    ('BH', 'Bahrain (BHD)'),
-]
+MARKET_CURRENCY = {
+    'UAE': 'AED', 'OM': 'AED',
+    'SA': 'BHD', 'KW': 'BHD', 'QA': 'BHD', 'BH': 'BHD',
+    'IQ': 'IQD',
+}
+CURRENCY_DEFAULTS = {'AED': 3.6725, 'BHD': 0.3760, 'IQD': 1310.0}
+
 with st.sidebar:
     st.divider()
-    st.header("Currency (AOV → USD)")
-    with st.expander("Set exchange rates", expanded=False):
+    st.header("Currency")
+    currency_mode = st.radio(
+        "Currency", ["Original (as recorded)", "USD"], index=1, label_visibility="collapsed",
+    )
+    fx_rates = {}
+    if currency_mode == "USD":
         st.caption(
-            "Local currency units = $1 USD, for the AOV per Agent section below. Leave a "
-            "market at 0 to leave its orders unconverted (shown in local currency only). "
-            "Reference only (not pre-filled, rates move): as of Sep 9, 2026, IQD official "
-            "CBI rate ≈ 1,310, parallel market ≈ 1,560 per $1."
+            "1 USD = how many of each currency -- NOT live rates, starting defaults only, edit "
+            "freely. AED and BHD are both long-standing hard pegs to the Dollar; IQD drifts more, "
+            "so it's worth checking that one periodically."
         )
-        fx_rates = {}
-        for code, label in FX_MARKETS:
-            rate = st.number_input(label, min_value=0.0, value=0.0, step=0.01, format="%.4f", key=f"fx_{code}")
+        c_aed, c_bhd, c_iqd = st.columns(3)
+        aed_rate = c_aed.number_input("1 USD = _\nAED", min_value=0.0, value=CURRENCY_DEFAULTS['AED'], step=0.0001, format="%.4f")
+        bhd_rate = c_bhd.number_input("1 USD = _\nBHD", min_value=0.0, value=CURRENCY_DEFAULTS['BHD'], step=0.0001, format="%.4f")
+        iqd_rate = c_iqd.number_input("1 USD = _\nIQD", min_value=0.0, value=CURRENCY_DEFAULTS['IQD'], step=1.0, format="%.1f")
+        currency_rates = {'AED': aed_rate, 'BHD': bhd_rate, 'IQD': iqd_rate}
+        for market, currency in MARKET_CURRENCY.items():
+            rate = currency_rates.get(currency)
             if rate:
-                fx_rates[code] = rate
+                fx_rates[market] = rate
 
 # ---------------------------------------------------------------------------
 # AOV per agent data -- fetched once here (before Export, which needs it) and
@@ -364,8 +374,8 @@ with st.sidebar:
     )
     period_label = f"{start:%Y-%m-%d} → {end:%Y-%m-%d}"
     currency_note = (
-        "AOV converted to USD using: " + ", ".join(f"{k}={v:g}" for k, v in fx_rates.items())
-        if fx_rates else "AOV not converted to USD (no rate set)"
+        "AOV converted to USD using: " + ", ".join(f"{k}={v:g}" for k, v in currency_rates.items())
+        if currency_mode == "USD" else "AOV shown in original currency (not converted)"
     )
     export_bytes = logic.export_excel(
         result, comparison=comparison, sections=export_sections,
@@ -455,17 +465,18 @@ else:
     has_usd = 'AOV (USD)' in aov_df.columns
     if not fx_rates:
         st.warning(
-            "⚠️ No exchange rate set -- these AOV figures are shown in the Orders sheet's "
-            "original currency, as-is, not converted to USD. Set a rate per market in the "
-            "**Currency (AOV → USD)** section of the sidebar to compare against the CEO "
+            "⚠️ Currency is set to \"Original (as recorded)\" -- these AOV figures are shown "
+            "in the Orders sheet's original currency, as-is, not converted to USD. Switch the "
+            "**Currency** toggle in the sidebar to \"USD\" to compare against the CEO "
             "scorecard's AOV target ($90-130, market-dependent).",
             icon="⚠️",
         )
     else:
         st.caption(
-            "AOV (USD) columns use the rate(s) set in the sidebar's **Currency (AOV → USD)** "
-            "section. Orders in a market without a rate set stay out of those columns (shown "
-            "in the Orders/AOV/Total Value columns in local currency only)."
+            "AOV (USD) columns use the rate(s) set in the sidebar's **Currency** section "
+            "(UAE + Oman via AED, Saudi + Kuwait + Qatar + Bahrain via BHD, Iraq via IQD). "
+            "Orders in any other market stay out of those columns (shown in the "
+            "Orders/AOV/Total Value columns in local currency only)."
         )
     if aov_diag:
         st.info(aov_diag)
