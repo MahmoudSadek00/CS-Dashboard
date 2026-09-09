@@ -334,14 +334,25 @@ def build_roster(agents, schedule, calls, chats, activity):
     else:
         agents['Team'] = agents.apply(
             lambda r: r['Team'] if pd.notna(r['Team']) else TEAM_OVERRIDE.get(r['Agent Name'], 'CS'), axis=1)
+    # A blank/non-numeric Agent ID (e.g. a new hire added to the Agents ID tab before
+    # HR/Ops assigned them one) used to crash the whole app on load ("cannot convert
+    # float NaN to integer") -- coerce instead, drop those rows from the ID-keyed
+    # roster, and keep their names so they aren't silently lost (see off_roster below).
+    agents['Agent ID'] = pd.to_numeric(agents['Agent ID'], errors='coerce')
+    missing_id_mask = agents['Agent ID'].isna()
+    agents_missing_id = sorted(agents.loc[missing_id_mask, 'Agent Name'].tolist())
+    agents = agents.loc[~missing_id_mask].reset_index(drop=True)
     agents['Agent ID'] = agents['Agent ID'].astype(int)
     id_to_name = dict(zip(agents['Agent ID'], agents['Agent Name']))
     roster = agents['Agent Name'].tolist()
 
-    # add off-roster-but-scheduled people (e.g. "Hagar Shaban") so Schedule/Calls/
-    # Activity data for them isn't silently dropped just because they have no Agent ID yet
+    # add off-roster-but-scheduled people (e.g. "Hagar Shaban") AND anyone on the
+    # Agents ID tab with a blank Agent ID, so Schedule/Calls/Activity data isn't
+    # silently dropped just because they have no Agent ID yet -- Chats can't be
+    # attributed to them though (Assignee is ID-based), which is why they're flagged
+    # separately (agents_missing_id) rather than treated as fully resolved.
     sched_names = set(SCHEDULE_NAME_MAP.values())
-    off_roster = sorted(sched_names - set(roster))
+    off_roster = sorted((sched_names - set(roster)) | set(agents_missing_id))
     full_roster = roster + off_roster
 
     calls = calls.copy()
@@ -397,6 +408,7 @@ def build_roster(agents, schedule, calls, chats, activity):
     return {
         'agents': agents, 'schedule': schedule, 'calls': calls, 'chats': chats,
         'activity': activity, 'roster': roster, 'off_roster': off_roster,
+        'agents_missing_id': agents_missing_id,
         'full_roster': full_roster, 'id_to_name': id_to_name,
     }
 
