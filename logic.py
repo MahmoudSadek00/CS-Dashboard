@@ -22,6 +22,7 @@ Streamlit tool, adapted to:
     resolved chat's close time
 """
 import datetime as dt
+import io
 
 import numpy as np
 import pandas as pd
@@ -131,6 +132,49 @@ CALL_STATES = ['Serviced', 'Dropped', 'No Answer', 'Abandoned', 'Blocked', 'Busy
 CALL_ANSWERED_STATES = {'Serviced'}
 
 FCR_WINDOW_DAYS = 7
+
+# ---------------------------------------------------------------------------
+# CEO Q3 2026 scorecard targets -- the two CS-relevant Performance KPIs this
+# tool actually has real numbers for (Item 1: Call Answer Rate, weighted 0.2;
+# Item 6: First Contact Resolution, weighted 0.1). Bands come straight from the
+# "GC KPIs (Younes) Q3 2026 CEO direction" scorecard's Below(Red)/Target(Green)/
+# Exceed(Stretch) columns. The other 6 Performance KPIs (Net Delivery, On-Time
+# Delivery, Delivery Time, Packaging Quality, CSAT, Draft Order AOV) either
+# belong to Logistics (not this tool) or don't have a live number here yet.
+CEO_TARGETS = {
+    'answered_rate': {'red_max': 90.0, 'green_min': 95.0, 'stretch_min': 98.0},
+    'fcr_rate': {'red_max': 80.0, 'green_min': 90.0, 'stretch_min': None},
+}
+
+TARGET_BADGES = {
+    'stretch': '🔵 Exceeds CEO stretch target',
+    'green': '🟢 Meets CEO target',
+    'amber': '🟡 Below CEO target',
+    'red': '🔴 Below CEO red line',
+}
+
+
+def target_status(value, red_max, green_min, stretch_min=None):
+    """Below(Red) / (implied amber gap) / Target(Green) / Exceed(Stretch), matching
+    the CEO scorecard's three named bands plus the unnamed gap between Red and Green
+    that the scorecard's own numbers leave open (e.g. 90-94.9% for Answer Rate)."""
+    if value is None:
+        return None
+    if stretch_min is not None and value >= stretch_min:
+        return 'stretch'
+    if value >= green_min:
+        return 'green'
+    if value < red_max:
+        return 'red'
+    return 'amber'
+
+
+def target_badge(value, key):
+    cfg = CEO_TARGETS.get(key)
+    if not cfg or value is None:
+        return None
+    status = target_status(value, cfg['red_max'], cfg['green_min'], cfg.get('stretch_min'))
+    return TARGET_BADGES.get(status)
 
 
 def norm(s):
@@ -686,6 +730,11 @@ def compute_overall(chats_df, calls_df, calls_totals, adherence_df):
     o['answered_rate'] = calls_totals['answered_rate']
     o['call_state_totals'] = calls_totals['state_totals']
     o['unattributed_calls'] = calls_totals['unattributed_calls']
+    state_totals = calls_totals['state_totals']
+    o['dropped_rate'] = (round(state_totals['Dropped'] / o['total_calls'] * 100, 1)
+                          if o['total_calls'] else None)
+    o['abandoned_rate'] = (round(state_totals['Abandoned'] / o['total_calls'] * 100, 1)
+                            if o['total_calls'] else None)
 
     o['agents_in_scope'] = int(len(set(chats_df['Agent']) | set(calls_df['Agent']) | set(adherence_df['Agent'] if not adherence_df.empty else [])))
     if not adherence_df.empty:
@@ -837,3 +886,115 @@ def build_comparison(report_a, report_b):
         'overall': overall_cmp, 'chats': chats_cmp, 'calls': calls_cmp,
         'adherence': adherence_cmp, 'highlights': highlights,
     }
+
+
+# ---------------------------------------------------------------------------
+# Excel export -- the whole report, or a hand-picked subset of sections, as one
+# .xlsx with a sheet per section. Sheet names are kept under Excel's 31-char cap.
+# ---------------------------------------------------------------------------
+def export_excel(result, comparison=None, sections=None):
+    sections = sections or ['Overall', 'Chats', 'Calls', 'Adherence']
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+        if 'Overall' in sections:
+            overall = result['overall']
+            scalar_rows = [{'Metric': k, 'Value': v} for k, v in overall.items()
+                            if not isinstance(v, dict)]
+            pd.DataFrame(scalar_rows).to_excel(writer, sheet_name='Overall', index=False)
+            pd.DataFrame(list(overall['call_state_totals'].items()), columns=['State', 'Calls']
+                         ).to_excel(writer, sheet_name='Calls by State', index=False)
+        if 'Chats' in sections:
+            result['chats'].to_excel(writer, sheet_name='Chats', index=False)
+        if 'Calls' in sections:
+            result['calls'].to_excel(writer, sheet_name='Calls', index=False)
+        if 'Adherence' in sections:
+            result['adherence'].to_excel(writer, sheet_name='Adherence', index=False)
+        if comparison is not None and 'Comparison' in sections:
+            comparison['overall'].to_excel(writer, sheet_name='Comparison Overall', index=False)
+            comparison['chats'].to_excel(writer, sheet_name='Comparison Chats', index=False)
+            comparison['calls'].to_excel(writer, sheet_name='Comparison Calls', index=False)
+            comparison['adherence'].to_excel(writer, sheet_name='Comparison Adherence', index=False)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# AOV per agent -- from the separate Orders "Clean" sheet's Orders tab, Salesman
+# column (Mahmoud, Sep 2026). This is a DIFFERENT spreadsheet from the CS sheet --
+# needs its own Viewer share for the same service account, see the README.
+#
+# Only the Salesman column's position/values were confirmed directly ("last column,
+# either 'Created by customer' or the agent's name -- we want the agent name").
+# The order-value, date and market columns were NOT confirmed, so this is written
+# defensively: it guesses from a short list of likely names and returns a clear
+# diagnostic (not a crash, not a silent wrong number) if it can't find them, so the
+# UI can show exactly what went wrong instead of a raw traceback.
+# ---------------------------------------------------------------------------
+AOV_DATE_CANDIDATES = ['Created', 'Order Date', 'Date', 'Created At', 'Order Created']
+AOV_VALUE_CANDIDATES = ['Subtotal', 'Order Value', 'Total', 'Amount', 'Value', 'Order Total']
+AOV_MARKET_CANDIDATES = ['Country', 'Shipping Country', 'Market']
+NOT_AGENT_SALESMAN = {'created by customer'}
+
+
+def _find_column(columns, candidates):
+    lower = {str(c).strip().lower(): c for c in columns}
+    for cand in candidates:
+        if cand.lower() in lower:
+            return lower[cand.lower()]
+    for c in columns:
+        for cand in candidates:
+            if cand.lower() in str(c).lower():
+                return c
+    return None
+
+
+def load_orders_clean(gc, spreadsheet_id, tab_name='Orders'):
+    sh = gc.open_by_key(spreadsheet_id)
+    return _worksheet_to_df(sh.worksheet(tab_name))
+
+
+def compute_aov_by_agent(orders_df, start, end):
+    """Returns (aov_df, diagnostic). aov_df is None (with diagnostic explaining why)
+    if the sheet's column names couldn't be confidently identified -- see the module
+    docstring above this function for why that's the fallback here rather than a
+    best-effort guess that could quietly be wrong."""
+    if orders_df.empty:
+        return None, "The Orders tab came back empty."
+    columns = list(orders_df.columns)
+    salesman_col = 'Salesman' if 'Salesman' in columns else columns[-1]
+    date_col = _find_column(columns, AOV_DATE_CANDIDATES)
+    value_col = _find_column(columns, AOV_VALUE_CANDIDATES)
+    market_col = _find_column(columns, AOV_MARKET_CANDIDATES)
+    missing = [name for name, col in [('a date', date_col), ('an order-value', value_col)] if col is None]
+    if missing:
+        return None, (f"Couldn't confidently find {' or '.join(missing)} column. "
+                       f"Columns actually seen in the Orders tab: {columns}")
+
+    work = orders_df.copy()
+    if work[date_col].map(lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)).any():
+        work[date_col] = work[date_col].map(_serial_to_ts)
+    else:
+        work[date_col] = pd.to_datetime(work[date_col], errors='coerce')
+    work[value_col] = pd.to_numeric(work[value_col], errors='coerce')
+
+    win = work[_in_range(work[date_col], start, end)]
+    salesman_norm = win[salesman_col].astype(str).str.strip()
+    agent_orders = win[~salesman_norm.str.lower().isin(NOT_AGENT_SALESMAN) & (salesman_norm != '') & win[value_col].notna()]
+    if agent_orders.empty:
+        return pd.DataFrame(columns=['Agent', 'Orders', 'AOV', 'Total Value']), None
+
+    # One row per agent (this is "AOV per agent", not per agent-per-market) --
+    # Market, if present, is folded in as an informational "Markets" column (the
+    # distinct markets that agent's orders touched) rather than splitting the agent
+    # across multiple rows, which would make the headline AOV number impossible to
+    # read at a glance.
+    grouped = agent_orders.groupby(salesman_col)[value_col].agg(['count', 'mean', 'sum']).reset_index()
+    grouped = grouped.rename(columns={salesman_col: 'Agent', 'count': 'Orders', 'mean': 'AOV', 'sum': 'Total Value'})
+    if market_col:
+        markets = agent_orders.groupby(salesman_col)[market_col].apply(
+            lambda s: ', '.join(sorted(set(str(v).strip() for v in s if str(v).strip())))
+        ).reset_index().rename(columns={salesman_col: 'Agent', market_col: 'Markets'})
+        grouped = grouped.merge(markets, on='Agent', how='left')
+    grouped['AOV'] = grouped['AOV'].round(2)
+    grouped['Total Value'] = grouped['Total Value'].round(2)
+    grouped = grouped.sort_values('Total Value', ascending=False).reset_index(drop=True)
+    return grouped, None
