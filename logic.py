@@ -124,8 +124,11 @@ TECH_STATE = 'Away - technical issue'
 OFFLINE_STATE = 'Offline'
 RECLASS_STATES = BREAK_STATES | {COACHING_STATE, TRAINING_STATE}
 
-CALL_STATES = ['Serviced', 'Successful', 'Dropped', 'No Answer', 'Abandoned', 'Blocked', 'Busy', 'Failed']
-CALL_ANSWERED_STATES = {'Serviced', 'Successful'}
+# Serviced and Successful merged into one "Serviced" bucket, per Mahmoud (Sep 2026) --
+# the platform's own docs draw no real distinction Ops needs to track separately.
+CALL_STATE_NORMALIZE = {'Successful': 'Serviced'}
+CALL_STATES = ['Serviced', 'Dropped', 'No Answer', 'Abandoned', 'Blocked', 'Busy', 'Failed']
+CALL_ANSWERED_STATES = {'Serviced'}
 
 FCR_WINDOW_DAYS = 7
 
@@ -135,8 +138,27 @@ def norm(s):
 
 
 def to_timedelta(s):
+    """Duration cell -> Timedelta, tolerant of every shape the two data sources hand
+    back for the same "00:01:42" cell: an 'H:M:S' string (typed-in / CSV), a
+    datetime.time (xlsx via openpyxl -- str() on it happens to already read 'H:M:S',
+    so the string branch below catches it too), or a bare fraction-of-a-day float
+    (gspread's UNFORMATTED_VALUE for a duration-formatted Sheets cell -- e.g. 102
+    seconds comes back as 0.0011805..., NOT text -- silently parsed as 0 by the old
+    string-only version, which is exactly why Avg Handling Time read all zeros on
+    the live-Sheets path)."""
     if pd.isna(s) or s == '':
         return pd.Timedelta(0)
+    if isinstance(s, pd.Timedelta):
+        return s
+    if isinstance(s, dt.timedelta):
+        return pd.Timedelta(s)
+    if isinstance(s, bool):
+        return pd.Timedelta(0)
+    if isinstance(s, (int, float)):
+        try:
+            return pd.Timedelta(days=float(s))
+        except Exception:
+            return pd.Timedelta(0)
     try:
         h, m, sec = str(s).split(':')
         return pd.Timedelta(hours=int(h), minutes=int(m), seconds=int(sec))
@@ -207,10 +229,20 @@ def build_roster(agents, schedule, calls, chats, activity):
     calls = calls.copy()
     calls['Agent_n'] = calls['Agent'].map(norm)
     calls['Created'] = pd.to_datetime(calls['Created'], errors='coerce')
+    calls['State'] = calls['State'].astype(str).str.strip().map(lambda s: CALL_STATE_NORMALIZE.get(s, s))
 
     chats = chats.copy()
     chats['DateTime Conversation Started'] = pd.to_datetime(chats['DateTime Conversation Started'], errors='coerce')
     chats['DateTime Conversation Resolved'] = pd.to_datetime(chats['DateTime Conversation Resolved'], errors='coerce')
+    # Opportunistic -- these columns aren't in the minimal Chats shape this tool was
+    # first built against, but the raw Carecomm export can carry them. Parsed with the
+    # same to_timedelta() used for Calls (tolerant of "H:M:S" text AND the Sheets
+    # duration-serial float) whenever the column exists, so richer per-agent chat KPIs
+    # (see compute_chats) switch on automatically the moment the live Chats tab has
+    # them -- no crash, no extra KPI, if it doesn't.
+    for col in ('First Response Time', 'Resolution Time'):
+        if col in chats.columns:
+            chats[col + ' (td)'] = chats[col].map(to_timedelta)
 
     activity = activity.copy()
     activity['Agent_n'] = activity['Agent Name'].map(norm)
@@ -493,7 +525,10 @@ def compute_adherence(data, start, end):
             'Shrinkage %': round(shrinkage, 1) if pd.notna(shrinkage) else None,
             'Incomplete Days': incomplete_n,
         })
-    adherence_df = pd.DataFrame(rows)
+    adherence_cols = ['Agent', 'Team', 'Working Days', 'Days Off', 'Planned Minutes', 'Actual Minutes',
+                       'Adherence %', 'Late Minutes', 'Early Logout Minutes', 'Occupancy %',
+                       'Shrinkage %', 'Incomplete Days']
+    adherence_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=adherence_cols)
     return adherence_df, daily_df, unclassified_df
 
 
@@ -530,6 +565,13 @@ def compute_chats(data, start, end, denom_days):
     win_scoped = win[win['canonical'].isin(roster)].copy()
     fcr_df = compute_fcr(win_scoped)
 
+    # Opportunistic richer KPIs -- only switch on if the live Chats tab actually has
+    # these columns (see build_roster). Kept separate from the required columns so a
+    # sheet without them just gets the original, smaller table -- no crash either way.
+    has_frt = 'First Response Time (td)' in win_scoped.columns
+    has_restime = 'Resolution Time (td)' in win_scoped.columns
+    has_category = 'Conversation Category' in win_scoped.columns
+
     rows = []
     for agent in roster:
         a = win_scoped[win_scoped['canonical'] == agent]
@@ -540,19 +582,38 @@ def compute_chats(data, start, end, denom_days):
         a_fcr = fcr_df[fcr_df['canonical'] == agent] if not fcr_df.empty else pd.DataFrame()
         fcr_rate = (a_fcr['FCR'].mean() * 100) if not a_fcr.empty else None
         days = denom_days.get(agent)
-        rows.append({
+        row = {
             'Agent': agent, 'Team': TEAM_OVERRIDE.get(agent, 'CS'),
             'Assigned': int(len(a)), 'Closed': int(len(closed)),
             'Unique Contacts': int(unique_contacts),
             'Avg per day': round(len(closed) / days, 2) if days else None,
             'FCR %': round(fcr_rate, 1) if fcr_rate is not None else None,
-        })
-    chats_df = pd.DataFrame(rows).sort_values('Closed', ascending=False).reset_index(drop=True)
+        }
+        if has_frt:
+            row['Avg First Response Time'] = fmt_td(a['First Response Time (td)'].mean())
+        if has_restime:
+            row['Avg Resolution Time'] = fmt_td(closed['Resolution Time (td)'].mean()) if not closed.empty else ''
+        rows.append(row)
+    chats_cols = ['Agent', 'Team', 'Assigned', 'Closed', 'Unique Contacts', 'Avg per day', 'FCR %']
+    if has_frt:
+        chats_cols.append('Avg First Response Time')
+    if has_restime:
+        chats_cols.append('Avg Resolution Time')
+    chats_df = (pd.DataFrame(rows).sort_values('Closed', ascending=False).reset_index(drop=True)
+                if rows else pd.DataFrame(columns=chats_cols))
 
     unmatched = win[win['canonical'].isna() | ~win['canonical'].isin(roster)]
     unmatched_ids = (unmatched['Assignee'].dropna().astype(int).value_counts()
                      if not unmatched.empty else pd.Series(dtype=int))
-    return chats_df, unmatched_ids
+
+    category_totals = None
+    if has_category:
+        vc = win_scoped['Conversation Category'].dropna()
+        vc = vc[vc.astype(str).str.strip() != '']
+        if not vc.empty:
+            category_totals = vc.value_counts().head(12).to_dict()
+
+    return chats_df, unmatched_ids, category_totals
 
 
 # ---------------------------------------------------------------------------
@@ -562,8 +623,8 @@ def compute_calls(data, start, end, denom_days):
     calls = data['calls']
     roster = data['full_roster']
     win = calls[_in_range(calls['Created'], start, end)].copy()
+    win['handle_td'] = win['Handling Duration'].map(to_timedelta)
     win_scoped = win[win['canonical'].isin(roster)].copy()
-    win_scoped['handle_td'] = win_scoped['Handling Duration'].map(to_timedelta)
 
     rows = []
     for agent in roster:
@@ -584,28 +645,47 @@ def compute_calls(data, start, end, denom_days):
         }
         row.update(state_counts)
         rows.append(row)
-    calls_df = pd.DataFrame(rows).sort_values('Total Calls', ascending=False).reset_index(drop=True)
-    return calls_df
+    calls_cols = ['Agent', 'Team', 'Total Calls', 'Answered %', 'Avg per day', 'Avg Handling Time'] + CALL_STATES
+    calls_df = (pd.DataFrame(rows).sort_values('Total Calls', ascending=False).reset_index(drop=True)
+                if rows else pd.DataFrame(columns=calls_cols))
+
+    # Company-wide totals from EVERY call in the period, not just the ones a single
+    # agent can be credited with. A call that never reached anyone -- essentially all
+    # Dropped calls, and some Abandoned ones -- has no Agent value at all, so it can
+    # never appear in the per-agent table above (correctly -- there's nobody to
+    # attribute it to). But deriving the Overall "Calls by state" totals by summing
+    # that per-agent table (the old approach) silently made those calls invisible
+    # company-wide too, which is exactly the "Dropped always reads 0" bug Mahmoud
+    # flagged -- the sheet has the Dropped rows, they just have a blank Agent column.
+    state_totals_all = {s: int((win['State'] == s).sum()) for s in CALL_STATES}
+    total_calls_all = int(len(win))
+    answered_all = sum(state_totals_all[s] for s in CALL_ANSWERED_STATES)
+    answered_rate_all = round(answered_all / total_calls_all * 100, 1) if total_calls_all else None
+    unattributed = int((~win['canonical'].isin(roster)).sum())
+
+    calls_totals = {
+        'state_totals': state_totals_all, 'total_calls': total_calls_all,
+        'answered_rate': answered_rate_all, 'unattributed_calls': unattributed,
+    }
+    return calls_df, calls_totals
 
 
 # ---------------------------------------------------------------------------
 # Overall roll-up (for the top metric cards)
 # ---------------------------------------------------------------------------
-def compute_overall(chats_df, calls_df, adherence_df):
+def compute_overall(chats_df, calls_df, calls_totals, adherence_df):
     o = {}
     o['total_chats_closed'] = int(chats_df['Closed'].sum()) if not chats_df.empty else 0
     o['total_chats_assigned'] = int(chats_df['Assigned'].sum()) if not chats_df.empty else 0
     valid_fcr = chats_df['FCR %'].dropna()
     o['fcr_rate'] = round(valid_fcr.mean(), 1) if len(valid_fcr) else None
 
-    o['total_calls'] = int(calls_df['Total Calls'].sum()) if not calls_df.empty else 0
-    if not calls_df.empty:
-        total_answered = sum(int(calls_df[s].sum()) for s in CALL_ANSWERED_STATES)
-        o['answered_rate'] = round(total_answered / o['total_calls'] * 100, 1) if o['total_calls'] else None
-        o['call_state_totals'] = {s: int(calls_df[s].sum()) for s in CALL_STATES}
-    else:
-        o['answered_rate'] = None
-        o['call_state_totals'] = {s: 0 for s in CALL_STATES}
+    # From calls_totals (the full period, unattributed calls included) rather than
+    # summed off the per-agent table -- see the comment in compute_calls.
+    o['total_calls'] = calls_totals['total_calls']
+    o['answered_rate'] = calls_totals['answered_rate']
+    o['call_state_totals'] = calls_totals['state_totals']
+    o['unattributed_calls'] = calls_totals['unattributed_calls']
 
     o['agents_in_scope'] = int(len(set(chats_df['Agent']) | set(calls_df['Agent']) | set(adherence_df['Agent'] if not adherence_df.empty else [])))
     if not adherence_df.empty:
@@ -628,13 +708,14 @@ def build_report_from_data(data, start, end):
     days_lookup = working_days_lookup(adherence_df)
     calendar_days = max(1, (pd.Timestamp(end) - pd.Timestamp(start)).days + 1)
     denom_days = {a: days_lookup.get(a, calendar_days) or calendar_days for a in data['full_roster']}
-    chats_df, unmatched_chat_ids = compute_chats(data, start, end, denom_days)
-    calls_df = compute_calls(data, start, end, denom_days)
-    overall = compute_overall(chats_df, calls_df, adherence_df)
+    chats_df, unmatched_chat_ids, chat_category_totals = compute_chats(data, start, end, denom_days)
+    calls_df, calls_totals = compute_calls(data, start, end, denom_days)
+    overall = compute_overall(chats_df, calls_df, calls_totals, adherence_df)
     return {
         'data': data, 'overall': overall, 'chats': chats_df, 'calls': calls_df,
         'adherence': adherence_df, 'daily_audit': daily_df, 'unclassified_shifts': unclassified_df,
-        'unmatched_chat_ids': unmatched_chat_ids,
+        'unmatched_chat_ids': unmatched_chat_ids, 'unattributed_calls': calls_totals['unattributed_calls'],
+        'chat_category_totals': chat_category_totals,
     }
 
 
@@ -646,3 +727,113 @@ def build_report(file_obj, start, end):
 def build_report_from_sheet(gc, spreadsheet_id, start, end):
     """From the live Google Sheet."""
     return build_report_from_data(load_from_sheet(gc, spreadsheet_id), start, end)
+
+
+# ---------------------------------------------------------------------------
+# Period comparison -- same concept as the existing Ops Pulse comparison report:
+# pick two date ranges (Period A / Period B), see every metric side by side with
+# a delta, both company-wide (Overall) and per agent. Operates on two already-
+# built report dicts (from build_report_from_sheet/build_report), so it works
+# the same way regardless of data source and needs no extra sheet access.
+# ---------------------------------------------------------------------------
+# (data key, label, unit, higher-is-better) -- Shrinkage is the one metric here where
+# a NEGATIVE delta is the improvement, so the highlight narrative below needs this to
+# classify "improved" vs "declined" correctly instead of just reading the delta's sign.
+OVERALL_COMPARISON_METRICS = [
+    ('total_chats_closed', 'Chats Closed', 'count', True),
+    ('fcr_rate', 'Chats FCR Rate', 'pp', True),
+    ('total_calls', 'Total Calls', 'count', True),
+    ('answered_rate', 'Calls Answered Rate', 'pp', True),
+    ('avg_adherence', 'Avg. Adherence', 'pp', True),
+    ('avg_occupancy', 'Avg. Occupancy', 'pp', True),
+    ('avg_shrinkage', 'Avg. Shrinkage', 'pp', False),
+]
+
+
+def _delta(a, b):
+    if a is None or b is None or pd.isna(a) or pd.isna(b):
+        return None
+    return round(b - a, 2)
+
+
+def compare_overall(overall_a, overall_b):
+    rows = []
+    for key, label, unit, higher_better in OVERALL_COMPARISON_METRICS:
+        a, b = overall_a.get(key), overall_b.get(key)
+        rows.append({'Metric': label, 'Period A': a, 'Period B': b, 'Delta': _delta(a, b),
+                     'Unit': unit, 'Higher Is Better': higher_better})
+    return pd.DataFrame(rows)
+
+
+def _safe_select(df, cols):
+    """df[['Agent', ...]], but tolerant of a completely empty/columnless DataFrame
+    (an empty period) instead of raising a KeyError."""
+    if df.empty or any(c not in df.columns for c in cols):
+        return pd.DataFrame(columns=cols)
+    return df[cols].copy()
+
+
+def _compare_agents(df_a, df_b, metric_cols):
+    cols = ['Agent'] + metric_cols
+    a, b = _safe_select(df_a, cols), _safe_select(df_b, cols)
+    merged = a.merge(b, on='Agent', how='outer', suffixes=(' (A)', ' (B)'))
+    ordered = ['Agent']
+    for col in metric_cols:
+        ca, cb, cd = f'{col} (A)', f'{col} (B)', f'{col} Δ'
+        merged[cd] = pd.to_numeric(merged[cb], errors='coerce') - pd.to_numeric(merged[ca], errors='coerce')
+        ordered += [ca, cb, cd]
+    return merged[ordered].sort_values('Agent').reset_index(drop=True)
+
+
+def compare_chats(chats_a, chats_b):
+    return _compare_agents(chats_a, chats_b, ['Closed', 'FCR %'])
+
+
+def compare_calls(calls_a, calls_b):
+    return _compare_agents(calls_a, calls_b, ['Total Calls', 'Answered %'])
+
+
+def compare_adherence(adherence_a, adherence_b):
+    return _compare_agents(adherence_a, adherence_b, ['Adherence %', 'Occupancy %'])
+
+
+def build_highlights(overall_cmp, chats_cmp, calls_cmp, adherence_cmp, top_n=3):
+    """Short "what changed most" narrative -- same spirit as Ops Pulse's Summary tab:
+    biggest movers first, split into improved / declined. Only rate metrics (pp) are
+    compared this way -- a raw count moving is just volume, not a rate improving or
+    declining, so it's left to the tables rather than the highlight list.
+
+    Each mover is (goodness, text): goodness is the delta re-signed so positive always
+    means "this got better" -- Shrinkage is the one metric here where a falling number
+    is the improvement, so its delta gets flipped before ranking; the text below always
+    shows the real, unflipped delta so the number itself never lies."""
+    movers = []
+    for _, r in overall_cmp.iterrows():
+        if r['Unit'] == 'pp' and r['Delta'] is not None:
+            goodness = r['Delta'] if r['Higher Is Better'] else -r['Delta']
+            movers.append((goodness, f"Company-wide: {r['Metric']} moved {r['Delta']:+.1f}pp "
+                                      f"({r['Period A']:.1f}% -> {r['Period B']:.1f}%)."))
+    for label, df, col in [
+        ('Chats FCR', chats_cmp, 'FCR % Δ'), ('Calls Answered rate', calls_cmp, 'Answered % Δ'),
+        ('Adherence', adherence_cmp, 'Adherence % Δ'), ('Occupancy', adherence_cmp, 'Occupancy % Δ'),
+    ]:
+        if col not in df.columns:
+            continue
+        for _, r in df.dropna(subset=[col]).iterrows():
+            movers.append((r[col], f"{r['Agent']} -- {label} moved {r[col]:+.1f}pp."))
+    movers.sort(key=lambda m: m[0])
+    declined = [m[1] for m in movers if m[0] < 0][:top_n]
+    improved = [m[1] for m in movers[::-1] if m[0] > 0][:top_n]
+    return {'improved': improved, 'declined': declined}
+
+
+def build_comparison(report_a, report_b):
+    overall_cmp = compare_overall(report_a['overall'], report_b['overall'])
+    chats_cmp = compare_chats(report_a['chats'], report_b['chats'])
+    calls_cmp = compare_calls(report_a['calls'], report_b['calls'])
+    adherence_cmp = compare_adherence(report_a['adherence'], report_b['adherence'])
+    highlights = build_highlights(overall_cmp, chats_cmp, calls_cmp, adherence_cmp)
+    return {
+        'overall': overall_cmp, 'chats': chats_cmp, 'calls': calls_cmp,
+        'adherence': adherence_cmp, 'highlights': highlights,
+    }
