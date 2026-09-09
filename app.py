@@ -583,3 +583,13 @@ with d4:
         st.caption("None in this period.")
     else:
         st.dataframe(wfh_overrides[['Agent', 'Date', 'Shift']], use_container_width=True, hide_index=True)
+
+agents_missing_id = result['data'].get('agents_missing_id', [])
+if agents_missing_id:
+    st.warning(
+        f"⚠️ {len(agents_missing_id)} name(s) on the **Agents ID** tab have no Agent ID filled in "
+        f"yet: {', '.join(agents_missing_id)}. They're still included via name-matching (Calls/Activity/"
+        "Adherence), but can't receive Chats -- the Chats tab's Assignee column is ID-based, not name-"
+        "based. Fill in their Agent ID on the sheet to fix this. (This used to crash the whole app on "
+        "load instead -- a blank Agent ID cell is now skipped rather than fatal.)"
+    )
