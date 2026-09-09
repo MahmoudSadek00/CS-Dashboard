@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 
 import pandas as pd
 import streamlit as st
@@ -61,13 +62,54 @@ def _pct(v):
     return f"{v:.1f}%" if v is not None else "—"
 
 
+# ---------------------------------------------------------------------------
+# Data source: live Google Sheet (needs the service account secret configured on
+# this deployment, see README) or a manually uploaded workbook -- same computation
+# either way, logic.py just gets DataFrames from a different place.
+# ---------------------------------------------------------------------------
+DEFAULT_SPREADSHEET_ID = '1Lz9OaWLpEM-m9w-5bxITTPKs9e00ZfuGtCl3m1Iicpw'
+
+
+def _load_creds_info():
+    try:
+        if 'gcp_service_account' in st.secrets:
+            return dict(st.secrets['gcp_service_account'])
+        if 'gcp_service_account_json' in st.secrets:
+            raw = st.secrets['gcp_service_account_json']
+            return json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except Exception:
+        pass
+    return None
+
+
+creds_info = _load_creds_info()
+
 with st.sidebar:
     st.header("Data")
-    upload = st.file_uploader(
-        "Raw data workbook (Agents ID / Schedule / Calls / Chats / Agents Activity)",
-        type=['xlsx'],
+    source = st.radio(
+        "Source", ["Google Sheet (live)", "Upload file"],
+        index=0 if creds_info else 1,
+        help="Live reading needs a one-time Google service account secret -- see the README.",
     )
-    st.caption("Schedule must be in long format: Employee name, Date, Shift, Is WFH.")
+
+    upload = None
+    spreadsheet_id = None
+    if source == "Upload file":
+        upload = st.file_uploader(
+            "Raw data workbook (Agents ID / Schedule / Calls / Chats / Agents Activity)",
+            type=['xlsx'],
+        )
+        st.caption("Schedule must be in long format: Employee name, Date, Shift, Is WFH.")
+    else:
+        if not creds_info:
+            st.error("No Google credential configured on this deployment -- see the README, or switch to \"Upload file\".")
+        spreadsheet_id = st.text_input("Spreadsheet ID", value=DEFAULT_SPREADSHEET_ID)
+        if 'cache_bump' not in st.session_state:
+            st.session_state['cache_bump'] = 0
+        if st.button("🔄 Refresh from Google Sheets"):
+            st.session_state['cache_bump'] += 1
+            st.cache_data.clear()
+
     st.divider()
     st.header("Period")
     default_start = dt.date(2026, 7, 1)
@@ -76,18 +118,49 @@ with st.sidebar:
     st.divider()
     st.caption("Bahrain team is always excluded from this report.")
 
-if not upload:
-    st.info("Upload the raw data workbook in the sidebar to build the report.")
-    st.stop()
-
 if isinstance(date_range, tuple) and len(date_range) == 2:
     start, end = date_range
 else:
     st.warning("Pick a full date range (start and end).")
     st.stop()
 
-with st.spinner("Crunching the numbers..."):
-    result = logic.build_report(upload, pd.Timestamp(start), pd.Timestamp(end))
+
+@st.cache_resource(show_spinner=False)
+def _client(_creds_info):
+    return logic.get_client(_creds_info)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_sheet_report(_gc, spreadsheet_id, start, end, cache_bump):
+    # _gc / leading-underscore args aren't hashed by Streamlit's cache; cache_bump
+    # (no underscore) IS part of the cache key, so the sidebar Refresh button forces
+    # a fresh read even before the 600s TTL expires.
+    return logic.build_report_from_sheet(_gc, spreadsheet_id, start, end)
+
+
+if source == "Upload file":
+    if not upload:
+        st.info("Upload the raw data workbook in the sidebar to build the report.")
+        st.stop()
+    with st.spinner("Crunching the numbers..."):
+        result = logic.build_report(upload, pd.Timestamp(start), pd.Timestamp(end))
+else:
+    if not creds_info or not spreadsheet_id:
+        st.stop()
+    try:
+        gc = _client(creds_info)
+    except Exception as e:
+        st.error(f"Couldn't connect to Google Sheets with the configured credential: {e}")
+        st.stop()
+    with st.spinner("Reading the live sheet and crunching the numbers..."):
+        try:
+            result = _cached_sheet_report(gc, spreadsheet_id, pd.Timestamp(start), pd.Timestamp(end), st.session_state['cache_bump'])
+        except Exception as e:
+            st.error(
+                f"Couldn't read the spreadsheet: {e}\n\nMost likely cause: the service "
+                "account isn't shared as a Viewer on this specific sheet yet -- see the README."
+            )
+            st.stop()
 
 overall = result['overall']
 chats_df = result['chats']
