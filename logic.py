@@ -134,6 +134,15 @@ SHIFT_PLANNED_MIN = {
 }
 EIGHT_HOUR_TYPES = {'9 AM - 5 PM', '11 AM - 7 PM', '4 PM - 12 AM'}
 
+# Company policy, per Mahmoud (Sep 2026): on Friday/Saturday/Sunday, ANY real working
+# shift (Day Off/leave excluded, same NON_WORKING check as everywhere else) is treated
+# as work-from-home regardless of what the Schedule's "Is WFH" column literally says --
+# even overriding an explicit "No" there. Every day this override actually changes the
+# flag (i.e. the sheet didn't already say WFH=Yes) is tracked in daily_audit ('WFH
+# Overridden' column) and surfaced in the Diagnostics tab, so a "No" in the raw sheet
+# being silently treated as WFH stays visible/auditable rather than a silent overwrite.
+WFH_OVERRIDE_WEEKDAYS = {'Friday', 'Saturday', 'Sunday'}
+
 BREAK_STATES = {'Away - short break', 'Away - lunch break', 'Away - gomaa prayer'}
 COACHING_STATE = 'Away - coaching'
 TRAINING_STATE = 'Away - training'
@@ -255,6 +264,35 @@ def _mean_td_nonblank(df, raw_col, td_col):
     mask = ~(df[raw_col].isna() | (df[raw_col].astype(str).str.strip() == ''))
     vals = df.loc[mask, td_col]
     return vals.mean() if len(vals) else pd.NaT
+
+
+def _merge_intervals(intervals):
+    """[(start, end), ...] -> sorted, non-overlapping (start, end) tuples. Used to
+    collapse an agent's chat-handling windows before measuring occupied time, so
+    two chats worked at once count as ONE stretch of busy time, not double."""
+    if not intervals:
+        return []
+    ordered = sorted(intervals, key=lambda iv: iv[0])
+    merged = [list(ordered[0])]
+    for s, e in ordered[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+
+def _overlap_minutes(a_intervals, b_intervals):
+    """Total minutes where a_intervals and b_intervals overlap. Both are assumed
+    already merged/non-overlapping within themselves; a plain double loop is fine
+    since both lists are short (one shift window's worth of state/chat segments)."""
+    total = 0.0
+    for a_s, a_e in a_intervals:
+        for b_s, b_e in b_intervals:
+            cs, ce = max(a_s, b_s), min(a_e, b_e)
+            if ce > cs:
+                total += (ce - cs).total_seconds() / 60
+    return total
 
 
 def fix_activity_ts(v):
@@ -517,6 +555,7 @@ def shift_window(shift_label, day_dt):
 def compute_adherence(data, start, end):
     schedule = data['schedule']
     activity = data['activity']
+    chats = data['chats']
     roster = data['full_roster']
 
     sched_win = schedule[_in_range(schedule['Date'], start, end)].copy()
@@ -537,6 +576,23 @@ def compute_adherence(data, start, end):
             if e > s:
                 intervals.append([s, e, state])
         agent_intervals[agent] = intervals
+
+    # Occupancy needs to see chat-handling time too, not just call "Busy" state --
+    # per Mahmoud (Sep 2026), Busy only fires for calls, so an agent working chats
+    # all day still reads as "Available" and Occupancy comes out implausibly low.
+    # Approximated as [DateTime Conversation Started, DateTime Conversation
+    # Resolved] per conversation assigned to the agent -- the closest thing to an
+    # "I was handling this" window the Chats export actually has. Two conversations
+    # worked at once are merged into one stretch first so simultaneous chats don't
+    # double-count.
+    chat_intervals = {}
+    chats_scoped = chats[chats['canonical'].isin(roster)]
+    for agent, grp in chats_scoped.groupby('canonical'):
+        ivs = [
+            (s, e) for s, e in zip(grp['DateTime Conversation Started'], grp['DateTime Conversation Resolved'])
+            if pd.notna(s) and pd.notna(e) and e > s
+        ]
+        chat_intervals[agent] = _merge_intervals(ivs)
 
     def clip(intervals, ws, we):
         out = []
@@ -568,9 +624,16 @@ def compute_adherence(data, start, end):
                     'Agent': agent, 'Date': day_dt, 'Shift': shift_label,
                     'Working Day': False, 'Planned Minutes': 0, 'Actual Minutes': 0,
                     'Late Minutes': 0, 'Early Logout Minutes': 0, 'Break Minutes': 0,
-                    'Data Status': 'Complete',
+                    'Data Status': 'Complete', 'WFH Overridden': False,
                 })
                 continue
+
+            # Fri/Sat/Sun WFH override -- see WFH_OVERRIDE_WEEKDAYS above. Only reached
+            # for a genuine working shift (Day Off/leave already excluded above).
+            wfh_overridden = False
+            if not is_wfh and day_dt.day_name() in WFH_OVERRIDE_WEEKDAYS:
+                is_wfh = True
+                wfh_overridden = True
 
             win_start, win_end = shift_window(shift_label, day_dt)
             planned = SHIFT_PLANNED_MIN[shift_label]
@@ -600,6 +663,21 @@ def compute_adherence(data, start, end):
             tech_min = mins({TECH_STATE})
             actual = online_min + busy_min + coaching_min + training_min + tech_min
 
+            # Chat time that fell inside an "Available" stretch -- NOT inside
+            # "Busy", since that's already call time and would double-count.
+            # This is a reclassification within online_min, not extra minutes,
+            # so Actual Minutes above (which only cares about online vs. away)
+            # is unaffected.
+            avail_intervals = [(s, e) for s, e, st in clipped if st == 'Available']
+            window_clip_end = min(win_end + pd.Timedelta(hours=12), win_end + pd.Timedelta(hours=1))
+            agent_chat_ivs = chat_intervals.get(agent, [])
+            chat_clipped = [
+                (max(s, win_start), min(e, window_clip_end))
+                for s, e in agent_chat_ivs
+                if min(e, window_clip_end) > max(s, win_start)
+            ]
+            chat_occupied_min = _overlap_minutes(avail_intervals, chat_clipped)
+
             active = [iv for iv in clipped if iv[2] != OFFLINE_STATE]
             login = active[0][0] if active else None
             logout = active[-1][1] if active else None
@@ -609,8 +687,10 @@ def compute_adherence(data, start, end):
             daily_rows.append({
                 'Agent': agent, 'Date': day_dt, 'Shift': shift_label,
                 'Working Day': True, 'Nine Hour': nine_hour, 'Is WFH': is_wfh,
+                'WFH Overridden': wfh_overridden,
                 'Planned Minutes': planned, 'Actual Minutes': round(actual, 1),
                 'Online Minutes': round(online_min, 1), 'Busy Minutes': round(busy_min, 1),
+                'Chat Occupied Minutes': round(chat_occupied_min, 1),
                 'Break Minutes': round(break_min, 1), 'Coaching Minutes': round(coaching_min, 1),
                 'Training Minutes': round(training_min, 1), 'Technical Minutes': round(tech_min, 1),
                 'Late Minutes': round(late_min, 1), 'Early Logout Minutes': round(early_min, 1),
@@ -632,8 +712,10 @@ def compute_adherence(data, start, end):
         actual = complete['Actual Minutes'].sum()
         online = complete.get('Online Minutes', pd.Series(dtype=float)).sum()
         busy = complete.get('Busy Minutes', pd.Series(dtype=float)).sum()
+        chat_occ = complete.get('Chat Occupied Minutes', pd.Series(dtype=float)).sum()
+        occupied = busy + chat_occ
         reachable = online + busy
-        occupancy = (busy / reachable * 100) if reachable else np.nan
+        occupancy = (occupied / reachable * 100) if reachable else np.nan
         shrink_min = (complete.get('Break Minutes', pd.Series(dtype=float)).sum()
                       + complete.get('Coaching Minutes', pd.Series(dtype=float)).sum()
                       + complete.get('Training Minutes', pd.Series(dtype=float)).sum()
@@ -648,19 +730,21 @@ def compute_adherence(data, start, end):
             'Adherence %': round(adherence_pct, 1) if pd.notna(adherence_pct) else None,
             'Late Minutes': round(complete['Late Minutes'].sum(), 0),
             'Early Logout Minutes': round(complete['Early Logout Minutes'].sum(), 0),
-            # The two raw components behind Occupancy % (Busy / (Available + Busy)) --
-            # shown here, not just the ratio, so a number that looks off (e.g. Sep 2026,
-            # per Mahmoud -- an implausibly low company-wide Occupancy) can be traced to
-            # WHICH side is unexpected (almost no Busy minutes logged at all? or Available
-            # minutes dwarfing it?) straight from this table, without having to guess.
-            'Available Minutes': round(online, 0), 'Busy Minutes': round(busy, 0),
+            # The raw components behind Occupancy % (now (Busy + Chat) / (Available +
+            # Busy), not just call-Busy -- per Mahmoud (Sep 2026), Busy only fires for
+            # calls, so an agent who's mostly on chats read as "Available" nearly all
+            # day and Occupancy came out implausibly low even though she was working.
+            # All three shown separately, not just the ratio, so a number that looks
+            # off can be traced to WHICH side is unexpected straight from this table.
+            'Available Minutes': round(online, 0), 'Busy Minutes (Calls)': round(busy, 0),
+            'Chat Minutes': round(chat_occ, 0),
             'Occupancy %': round(occupancy, 1) if pd.notna(occupancy) else None,
             'Shrinkage %': round(shrinkage, 1) if pd.notna(shrinkage) else None,
             'Incomplete Days': incomplete_n,
         })
     adherence_cols = ['Agent', 'Team', 'Working Days', 'Days Off', 'Planned Minutes', 'Actual Minutes',
                        'Adherence %', 'Late Minutes', 'Early Logout Minutes', 'Available Minutes',
-                       'Busy Minutes', 'Occupancy %', 'Shrinkage %', 'Incomplete Days']
+                       'Busy Minutes (Calls)', 'Chat Minutes', 'Occupancy %', 'Shrinkage %', 'Incomplete Days']
     adherence_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=adherence_cols)
     return adherence_df, daily_df, unclassified_df
 
@@ -836,8 +920,24 @@ def compute_overall(chats_df, calls_df, calls_totals, adherence_df):
         o['avg_adherence'] = round(adherence_df['Adherence %'].dropna().mean(), 1) if adherence_df['Adherence %'].notna().any() else None
         o['avg_occupancy'] = round(adherence_df['Occupancy %'].dropna().mean(), 1) if adherence_df['Occupancy %'].notna().any() else None
         o['avg_shrinkage'] = round(adherence_df['Shrinkage %'].dropna().mean(), 1) if adherence_df['Shrinkage %'].notna().any() else None
+        # Company-wide split of the "occupied" side of Occupancy % between calls and
+        # chats -- Mahmoud wants to see, not just the blended ratio, how much of it
+        # is calls vs. chats (surfaced as a popover on the Avg. Occupancy card).
+        calls_min = adherence_df['Busy Minutes (Calls)'].sum()
+        chat_min = adherence_df['Chat Minutes'].sum()
+        occupied_total = calls_min + chat_min
+        if occupied_total:
+            o['occupancy_calls_min'] = round(calls_min, 0)
+            o['occupancy_chat_min'] = round(chat_min, 0)
+            o['occupancy_calls_pct'] = round(calls_min / occupied_total * 100, 1)
+            o['occupancy_chat_pct'] = round(chat_min / occupied_total * 100, 1)
+        else:
+            o['occupancy_calls_min'] = o['occupancy_chat_min'] = 0
+            o['occupancy_calls_pct'] = o['occupancy_chat_pct'] = None
     else:
         o['avg_adherence'] = o['avg_occupancy'] = o['avg_shrinkage'] = None
+        o['occupancy_calls_min'] = o['occupancy_chat_min'] = 0
+        o['occupancy_calls_pct'] = o['occupancy_chat_pct'] = None
     return o
 
 
