@@ -49,6 +49,7 @@ CALLS_COLS_USED = ['Agent', 'Created', 'State', 'Handling Duration']
 CHATS_COLS_USED = [
     'DateTime Conversation Started', 'DateTime Conversation Resolved', 'Contact ID',
     'Assignee', 'First Response Time', 'Resolution Time', 'Conversation Category',
+    'First Assignment to First Response Time',
 ]
 
 
@@ -242,6 +243,20 @@ def fmt_td(td):
     return f"{sign}{h:02d}:{m:02d}:{s:02d}"
 
 
+def _mean_td_nonblank(df, raw_col, td_col):
+    """Average of a duration column, over ONLY the rows that actually have a value in
+    raw_col -- to_timedelta() maps a blank cell to Timedelta(0) (a genuinely 0-second
+    duration and "no value yet" are otherwise indistinguishable once converted), which
+    would silently pull the average toward 0 for every row still waiting on that event
+    (e.g. a conversation with no response yet has no 'First Response Time' to average
+    in at all -- it isn't a 0-second response). Returns pd.NaT if nothing qualifies."""
+    if df.empty:
+        return pd.NaT
+    mask = ~(df[raw_col].isna() | (df[raw_col].astype(str).str.strip() == ''))
+    vals = df.loc[mask, td_col]
+    return vals.mean() if len(vals) else pd.NaT
+
+
 def fix_activity_ts(v):
     """Agents Activity's Timestamp column mixes plain-text strings (correctly DD-MM-YYYY)
     with Excel-auto-converted datetime cells that get silently misread as MM-DD-YYYY,
@@ -305,7 +320,7 @@ def build_roster(agents, schedule, calls, chats, activity):
     # duration-serial float) whenever the column exists, so richer per-agent chat KPIs
     # (see compute_chats) switch on automatically the moment the live Chats tab has
     # them -- no crash, no extra KPI, if it doesn't.
-    for col in ('First Response Time', 'Resolution Time'):
+    for col in ('First Response Time', 'Resolution Time', 'First Assignment to First Response Time'):
         if col in chats.columns:
             chats[col + ' (td)'] = chats[col].map(to_timedelta)
 
@@ -633,13 +648,19 @@ def compute_adherence(data, start, end):
             'Adherence %': round(adherence_pct, 1) if pd.notna(adherence_pct) else None,
             'Late Minutes': round(complete['Late Minutes'].sum(), 0),
             'Early Logout Minutes': round(complete['Early Logout Minutes'].sum(), 0),
+            # The two raw components behind Occupancy % (Busy / (Available + Busy)) --
+            # shown here, not just the ratio, so a number that looks off (e.g. Sep 2026,
+            # per Mahmoud -- an implausibly low company-wide Occupancy) can be traced to
+            # WHICH side is unexpected (almost no Busy minutes logged at all? or Available
+            # minutes dwarfing it?) straight from this table, without having to guess.
+            'Available Minutes': round(online, 0), 'Busy Minutes': round(busy, 0),
             'Occupancy %': round(occupancy, 1) if pd.notna(occupancy) else None,
             'Shrinkage %': round(shrinkage, 1) if pd.notna(shrinkage) else None,
             'Incomplete Days': incomplete_n,
         })
     adherence_cols = ['Agent', 'Team', 'Working Days', 'Days Off', 'Planned Minutes', 'Actual Minutes',
-                       'Adherence %', 'Late Minutes', 'Early Logout Minutes', 'Occupancy %',
-                       'Shrinkage %', 'Incomplete Days']
+                       'Adherence %', 'Late Minutes', 'Early Logout Minutes', 'Available Minutes',
+                       'Busy Minutes', 'Occupancy %', 'Shrinkage %', 'Incomplete Days']
     adherence_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=adherence_cols)
     return adherence_df, daily_df, unclassified_df
 
@@ -682,6 +703,7 @@ def compute_chats(data, start, end, denom_days):
     # sheet without them just gets the original, smaller table -- no crash either way.
     has_frt = 'First Response Time (td)' in win_scoped.columns
     has_restime = 'Resolution Time (td)' in win_scoped.columns
+    has_atfr = 'First Assignment to First Response Time (td)' in win_scoped.columns
     has_category = 'Conversation Category' in win_scoped.columns
 
     rows = []
@@ -702,13 +724,18 @@ def compute_chats(data, start, end, denom_days):
             'FCR %': round(fcr_rate, 1) if fcr_rate is not None else None,
         }
         if has_frt:
-            row['Avg First Response Time'] = fmt_td(a['First Response Time (td)'].mean())
+            row['Avg First Response Time'] = fmt_td(_mean_td_nonblank(a, 'First Response Time', 'First Response Time (td)'))
+        if has_atfr:
+            row['Avg First Assignment to First Response'] = fmt_td(
+                _mean_td_nonblank(a, 'First Assignment to First Response Time', 'First Assignment to First Response Time (td)'))
         if has_restime:
-            row['Avg Resolution Time'] = fmt_td(closed['Resolution Time (td)'].mean()) if not closed.empty else ''
+            row['Avg Resolution Time'] = fmt_td(_mean_td_nonblank(closed, 'Resolution Time', 'Resolution Time (td)'))
         rows.append(row)
     chats_cols = ['Agent', 'Team', 'Assigned', 'Closed', 'Unique Contacts', 'Avg per day', 'FCR %']
     if has_frt:
         chats_cols.append('Avg First Response Time')
+    if has_atfr:
+        chats_cols.append('Avg First Assignment to First Response')
     if has_restime:
         chats_cols.append('Avg Resolution Time')
     chats_df = (pd.DataFrame(rows).sort_values('Closed', ascending=False).reset_index(drop=True)
