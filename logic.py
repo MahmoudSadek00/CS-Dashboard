@@ -25,6 +25,20 @@ import datetime as dt
 
 import numpy as np
 import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
+
+# Read-only -- this tool never writes back to the sheet.
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets.readonly',
+    'https://www.googleapis.com/auth/drive.readonly',
+]
+GOOGLE_SHEETS_EPOCH = dt.date(1899, 12, 30)
+
+
+def get_client(service_account_info):
+    creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
+    return gspread.authorize(creds)
 
 # ---------------------------------------------------------------------------
 # Roster / scope
@@ -200,7 +214,12 @@ def build_roster(agents, schedule, calls, chats, activity):
 
     activity = activity.copy()
     activity['Agent_n'] = activity['Agent Name'].map(norm)
-    activity['ts'] = activity['Timestamp'].map(fix_activity_ts)
+    if 'ts' not in activity.columns:
+        # xlsx path only -- the live-sheet path (fetch_sheet_data) already fills 'ts'
+        # with correctly-parsed timestamps via _serial_to_ts, which has no day/month
+        # ambiguity to begin with, so it must NOT be run back through fix_activity_ts
+        # (that would blindly swap day/month a second time and corrupt every date).
+        activity['ts'] = activity['Timestamp'].map(fix_activity_ts)
 
     schedule = schedule.copy()
     schedule['sched_name'] = schedule['Employee name'].astype(str).str.strip()
@@ -230,6 +249,91 @@ def build_roster(agents, schedule, calls, chats, activity):
         'activity': activity, 'roster': roster, 'off_roster': off_roster,
         'full_roster': full_roster, 'id_to_name': id_to_name,
     }
+
+
+# ---------------------------------------------------------------------------
+# Live Google Sheets loading (reuses build_roster above -- same code path as the
+# xlsx upload once the 5 tabs are turned into DataFrames, so nothing about the
+# actual computation differs between "upload a file" and "read live").
+# ---------------------------------------------------------------------------
+def _serial_to_ts(value):
+    """A gspread UNFORMATTED_VALUE read gives real dates/datetimes back as plain
+    numbers (days since the sheets epoch, like Excel) -- NOT text, so there's no
+    string-vs-datetime ambiguity here the way there was with the xlsx export's
+    Agents Activity Timestamp column. Falls back to text parsing for a cell someone
+    typed in by hand as plain text instead of a real date/time value."""
+    if value in (None, ''):
+        return pd.NaT
+    if isinstance(value, bool):
+        return pd.NaT
+    if isinstance(value, (int, float)):
+        try:
+            return pd.Timestamp(GOOGLE_SHEETS_EPOCH) + pd.Timedelta(days=value)
+        except (OverflowError, ValueError):
+            return pd.NaT
+    s = str(value).strip()
+    if not s:
+        return pd.NaT
+    try:
+        return pd.Timestamp(pd.to_datetime(s, dayfirst=True))
+    except Exception:
+        return pd.NaT
+
+
+def _worksheet_to_df(ws):
+    """Raw values -> DataFrame, header row included, tolerant of short trailing rows
+    (Sheets omits fully-blank trailing cells) the way a plain get_all_records() isn't."""
+    values = ws.get_values(value_render_option='UNFORMATTED_VALUE')
+    if not values or len(values) < 2:
+        return pd.DataFrame(columns=values[0] if values else [])
+    header = [str(h).strip() for h in values[0]]
+    width = len(header)
+    body = [list(r) + [None] * (width - len(r)) if len(r) < width else r[:width] for r in values[1:]]
+    return pd.DataFrame(body, columns=header)
+
+
+def fetch_sheet_data(gc, spreadsheet_id):
+    """Reads the live Agents ID / Schedule / Calls / Chats / Agents Activity tabs and
+    returns them shaped exactly like pd.ExcelFile(...).parse(tab) would, so they can go
+    straight into build_roster() unchanged."""
+    sh = gc.open_by_key(spreadsheet_id)
+
+    agents = _worksheet_to_df(sh.worksheet('Agents ID'))
+    if 'Agent ID' in agents.columns:
+        agents['Agent ID'] = pd.to_numeric(agents['Agent ID'], errors='coerce')
+
+    schedule = _worksheet_to_df(sh.worksheet('Schedule'))
+    if 'Date' in schedule.columns:
+        schedule['Date'] = schedule['Date'].map(_serial_to_ts)
+
+    calls = _worksheet_to_df(sh.worksheet('Calls'))
+    if 'Created' in calls.columns:
+        calls['Created'] = calls['Created'].map(_serial_to_ts)
+
+    chats = _worksheet_to_df(sh.worksheet('Chats'))
+    for c in ('DateTime Conversation Started', 'DateTime Conversation Resolved'):
+        if c in chats.columns:
+            chats[c] = chats[c].map(_serial_to_ts)
+    if 'Assignee' in chats.columns:
+        chats['Assignee'] = pd.to_numeric(chats['Assignee'], errors='coerce')
+    if 'Contact ID' in chats.columns:
+        chats['Contact ID'] = pd.to_numeric(chats['Contact ID'], errors='coerce')
+
+    activity = _worksheet_to_df(sh.worksheet('Agents Activity'))
+    if 'Timestamp' in activity.columns:
+        activity['Timestamp'] = activity['Timestamp'].map(_serial_to_ts)
+        # Set 'ts' directly here (bypassing fix_activity_ts) -- _serial_to_ts already
+        # gives an unambiguous, correctly-parsed timestamp, unlike the xlsx export's
+        # mixed text/Excel-auto-converted Timestamp column. build_roster() only falls
+        # back to running fix_activity_ts itself when 'ts' isn't already present.
+        activity['ts'] = activity['Timestamp']
+
+    return agents, schedule, calls, chats, activity
+
+
+def load_from_sheet(gc, spreadsheet_id):
+    agents, schedule, calls, chats, activity = fetch_sheet_data(gc, spreadsheet_id)
+    return build_roster(agents, schedule, calls, chats, activity)
 
 
 def _in_range(series, start, end):
@@ -519,8 +623,7 @@ def working_days_lookup(adherence_df):
     return dict(zip(adherence_df['Agent'], adherence_df['Working Days']))
 
 
-def build_report(file_obj, start, end):
-    data = load_workbook(file_obj)
+def build_report_from_data(data, start, end):
     adherence_df, daily_df, unclassified_df = compute_adherence(data, start, end)
     days_lookup = working_days_lookup(adherence_df)
     calendar_days = max(1, (pd.Timestamp(end) - pd.Timestamp(start)).days + 1)
@@ -533,3 +636,13 @@ def build_report(file_obj, start, end):
         'adherence': adherence_df, 'daily_audit': daily_df, 'unclassified_shifts': unclassified_df,
         'unmatched_chat_ids': unmatched_chat_ids,
     }
+
+
+def build_report(file_obj, start, end):
+    """From an uploaded xlsx workbook."""
+    return build_report_from_data(load_workbook(file_obj), start, end)
+
+
+def build_report_from_sheet(gc, spreadsheet_id, start, end):
+    """From the live Google Sheet."""
+    return build_report_from_data(load_from_sheet(gc, spreadsheet_id), start, end)
