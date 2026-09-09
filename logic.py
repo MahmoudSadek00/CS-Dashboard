@@ -28,6 +28,9 @@ import numpy as np
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
+from openpyxl.styles import Font, PatternFill
+from openpyxl.chart import BarChart, Reference
+from openpyxl.utils import get_column_letter
 
 # Read-only -- this tool never writes back to the sheet.
 SCOPES = [
@@ -134,16 +137,22 @@ CALL_ANSWERED_STATES = {'Serviced'}
 FCR_WINDOW_DAYS = 7
 
 # ---------------------------------------------------------------------------
-# CEO Q3 2026 scorecard targets -- the two CS-relevant Performance KPIs this
-# tool actually has real numbers for (Item 1: Call Answer Rate, weighted 0.2;
-# Item 6: First Contact Resolution, weighted 0.1). Bands come straight from the
-# "GC KPIs (Younes) Q3 2026 CEO direction" scorecard's Below(Red)/Target(Green)/
-# Exceed(Stretch) columns. The other 6 Performance KPIs (Net Delivery, On-Time
-# Delivery, Delivery Time, Packaging Quality, CSAT, Draft Order AOV) either
-# belong to Logistics (not this tool) or don't have a live number here yet.
+# CEO Q3 2026 scorecard targets -- the CS-relevant Performance KPIs this tool
+# actually has real numbers for (Item 1: Call Answer Rate, weighted 0.2; Item 6:
+# First Contact Resolution, weighted 0.1; Draft Order AOV, $90-130 depending on
+# market -- only usable once AOV is converted to USD, see compute_aov_by_agent).
+# Bands come straight from the "GC KPIs (Younes) Q3 2026 CEO direction"
+# scorecard's Below(Red)/Target(Green)/Exceed(Stretch) columns. The remaining
+# Performance KPIs (Net Delivery, On-Time Delivery, Delivery Time, Packaging
+# Quality, CSAT) belong to Logistics, not this tool.
 CEO_TARGETS = {
     'answered_rate': {'red_max': 90.0, 'green_min': 95.0, 'stretch_min': 98.0},
     'fcr_rate': {'red_max': 80.0, 'green_min': 90.0, 'stretch_min': None},
+    # Scorecard gives a single $90-130 range rather than separate Red/Green/Stretch
+    # numbers, so this is a reasonable reading of it, not a value from the sheet:
+    # below $90 = red (missed even the floor), $90-129.99 = green (within range),
+    # $130+ = stretch (above the top of the range).
+    'aov_usd': {'red_max': 90.0, 'green_min': 90.0, 'stretch_min': 130.0},
 }
 
 TARGET_BADGES = {
@@ -891,29 +900,125 @@ def build_comparison(report_a, report_b):
 # ---------------------------------------------------------------------------
 # Excel export -- the whole report, or a hand-picked subset of sections, as one
 # .xlsx with a sheet per section. Sheet names are kept under Excel's 31-char cap.
+#
+# Visual style matches the existing Ops Pulse comparison export (same workbook
+# Mahmoud already has): a bold title + grey period/generated-at lines above each
+# table, a dark-green (#1F4E3D) bold-white header row, percent-formatted rate
+# columns, sized columns, a frozen header row, and a couple of embedded bar
+# charts -- rather than a bare pandas dump.
 # ---------------------------------------------------------------------------
-def export_excel(result, comparison=None, sections=None):
+_HEADER_FILL = PatternFill('solid', fgColor='1F4E3D')
+_HEADER_FONT = Font(bold=True, color='FFFFFF')
+_TITLE_FONT = Font(bold=True, size=13)
+_SUBTITLE_FONT = Font(color='555555')
+_PCT_FORMAT = '0.0"%"'  # values are already 0-100 scale in this codebase, not 0-1 fractions
+
+# Column names (as they appear in each exported table) that should render with a
+# "%" suffix instead of a bare number.
+_PCT_COLS_BY_SHEET = {
+    'Overall': set(),  # handled per-row below -- Value column mixes % and non-% metrics
+    'Chats': {'FCR %'},
+    'Calls': {'Answered %'},
+    'Adherence': {'Adherence %', 'Occupancy %', 'Shrinkage %'},
+    'AOV per Agent': set(),
+}
+
+
+def _write_titled_sheet(writer, df, sheet_name, title, subtitle, pct_cols=None):
+    """Writes df starting a few rows down (leaving room for a title block), then
+    styles the header row, sizes columns, freezes the header, and applies percent
+    formatting to the given column names. Returns (worksheet, header_row, first_data_row,
+    last_data_row) -- 1-indexed Excel rows -- for callers that want to add a chart."""
+    startrow = 3  # 0-indexed -- header lands on Excel row 4
+    df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=startrow)
+    ws = writer.sheets[sheet_name]
+    ws.cell(row=1, column=1, value=title).font = _TITLE_FONT
+    ws.cell(row=2, column=1, value=subtitle).font = _SUBTITLE_FONT
+
+    header_row = startrow + 1
+    ncols = max(len(df.columns), 1)
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        cell = ws.cell(row=header_row, column=col_idx)
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+        content_width = max((len(str(v)) for v in df[col_name]), default=0) if len(df) else 0
+        width = min(40, max(12, len(str(col_name)) + 4, content_width + 2))
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+        if pct_cols and col_name in pct_cols:
+            for row_idx in range(header_row + 1, header_row + 1 + len(df)):
+                ws.cell(row=row_idx, column=col_idx).number_format = _PCT_FORMAT
+    ws.freeze_panes = ws.cell(row=header_row + 1, column=1)
+    return ws, header_row, header_row + 1, header_row + len(df)
+
+
+def _add_bar_chart(ws, title, cat_col, val_col, first_data_row, last_data_row, anchor_row):
+    if last_data_row < first_data_row:
+        return  # nothing to chart
+    chart = BarChart()
+    chart.type = 'bar'
+    chart.title = title
+    chart.y_axis.title = None
+    chart.x_axis.title = None
+    cats = Reference(ws, min_col=cat_col, min_row=first_data_row, max_row=last_data_row)
+    vals = Reference(ws, min_col=val_col, min_row=first_data_row - 1, max_row=last_data_row)  # include header for series name
+    chart.add_data(vals, titles_from_data=True)
+    chart.set_categories(cats)
+    chart.height, chart.width = 8, 16
+    ws.add_chart(chart, f'A{anchor_row}')
+
+
+def export_excel(result, comparison=None, sections=None, aov_df=None, period_label=None, currency_note=None):
     sections = sections or ['Overall', 'Chats', 'Calls', 'Adherence']
+    generated = dt.datetime.now().strftime('%Y-%m-%d %H:%M')
+    subtitle = f"{period_label or ''}    |    Generated: {generated}".strip(' |')
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         if 'Overall' in sections:
             overall = result['overall']
             scalar_rows = [{'Metric': k, 'Value': v} for k, v in overall.items()
                             if not isinstance(v, dict)]
-            pd.DataFrame(scalar_rows).to_excel(writer, sheet_name='Overall', index=False)
-            pd.DataFrame(list(overall['call_state_totals'].items()), columns=['State', 'Calls']
-                         ).to_excel(writer, sheet_name='Calls by State', index=False)
+            overall_df = pd.DataFrame(scalar_rows)
+            ws, hdr, first, last = _write_titled_sheet(
+                writer, overall_df, 'Overall', 'CS Pulse -- Overall', subtitle)
+            # Value column mixes % and non-% metrics -- format only the '_rate' rows.
+            for row_idx, rec in zip(range(first, last + 1), scalar_rows):
+                if 'rate' in str(rec['Metric']).lower():
+                    ws.cell(row=row_idx, column=2).number_format = _PCT_FORMAT
+
+            state_df = pd.DataFrame(list(overall['call_state_totals'].items()), columns=['State', 'Calls'])
+            ws2, hdr2, first2, last2 = _write_titled_sheet(
+                writer, state_df, 'Calls by State', 'CS Pulse -- Calls by State', subtitle)
+            _add_bar_chart(ws2, 'Calls by state', cat_col=1, val_col=2, first_data_row=first2,
+                            last_data_row=last2, anchor_row=last2 + 3)
+
         if 'Chats' in sections:
-            result['chats'].to_excel(writer, sheet_name='Chats', index=False)
+            _write_titled_sheet(writer, result['chats'], 'Chats', 'CS Pulse -- Chats per Agent',
+                                 subtitle, pct_cols=_PCT_COLS_BY_SHEET['Chats'])
         if 'Calls' in sections:
-            result['calls'].to_excel(writer, sheet_name='Calls', index=False)
+            _write_titled_sheet(writer, result['calls'], 'Calls', 'CS Pulse -- Calls per Agent',
+                                 subtitle, pct_cols=_PCT_COLS_BY_SHEET['Calls'])
         if 'Adherence' in sections:
-            result['adherence'].to_excel(writer, sheet_name='Adherence', index=False)
+            _write_titled_sheet(writer, result['adherence'], 'Adherence', 'CS Pulse -- Adherence per Agent',
+                                 subtitle, pct_cols=_PCT_COLS_BY_SHEET['Adherence'])
+        if aov_df is not None and 'AOV' in sections:
+            aov_subtitle = subtitle + (f"    |    {currency_note}" if currency_note else '')
+            ws3, hdr3, first3, last3 = _write_titled_sheet(
+                writer, aov_df, 'AOV per Agent', 'CS Pulse -- AOV per Agent', aov_subtitle)
+            value_col_name = 'Total Value (USD)' if 'Total Value (USD)' in aov_df.columns else 'Total Value'
+            val_col_idx = list(aov_df.columns).index(value_col_name) + 1
+            _add_bar_chart(ws3, f'Total order value by agent ({value_col_name})', cat_col=1,
+                            val_col=val_col_idx, first_data_row=first3, last_data_row=last3,
+                            anchor_row=last3 + 3)
         if comparison is not None and 'Comparison' in sections:
-            comparison['overall'].to_excel(writer, sheet_name='Comparison Overall', index=False)
-            comparison['chats'].to_excel(writer, sheet_name='Comparison Chats', index=False)
-            comparison['calls'].to_excel(writer, sheet_name='Comparison Calls', index=False)
-            comparison['adherence'].to_excel(writer, sheet_name='Comparison Adherence', index=False)
+            _write_titled_sheet(writer, comparison['overall'], 'Comparison Overall',
+                                 'CS Pulse -- Comparison, Overall', subtitle)
+            _write_titled_sheet(writer, comparison['chats'], 'Comparison Chats',
+                                 'CS Pulse -- Comparison, Chats', subtitle)
+            _write_titled_sheet(writer, comparison['calls'], 'Comparison Calls',
+                                 'CS Pulse -- Comparison, Calls', subtitle)
+            _write_titled_sheet(writer, comparison['adherence'], 'Comparison Adherence',
+                                 'CS Pulse -- Comparison, Adherence', subtitle)
     return buf.getvalue()
 
 
@@ -952,11 +1057,22 @@ def load_orders_clean(gc, spreadsheet_id, tab_name='Orders'):
     return _worksheet_to_df(sh.worksheet(tab_name))
 
 
-def compute_aov_by_agent(orders_df, start, end):
+def compute_aov_by_agent(orders_df, start, end, fx_rates=None):
     """Returns (aov_df, diagnostic). aov_df is None (with diagnostic explaining why)
     if the sheet's column names couldn't be confidently identified -- see the module
     docstring above this function for why that's the fallback here rather than a
-    best-effort guess that could quietly be wrong."""
+    best-effort guess that could quietly be wrong.
+
+    fx_rates, if given, is a {market_code: rate} dict where rate means "local
+    currency units per 1 USD" (e.g. {'IQ': 1310} for 1,310 IQD = $1) -- entered by
+    Mahmoud in the app's sidebar, never guessed here (exchange rates move and
+    Ops Pulse itself doesn't convert currency, so there's no rate to inherit from
+    it). Conversion happens PER ORDER, before aggregation -- an agent whose orders
+    span more than one market/currency can't be correctly converted after the fact
+    by dividing an already-mixed-currency sum by a single rate. Orders in a market
+    with no rate supplied are simply left out of the USD columns (counted in the
+    native-currency Orders/AOV/Total Value columns as before) -- never silently
+    assigned somebody else's rate."""
     if orders_df.empty:
         return None, "The Orders tab came back empty."
     columns = list(orders_df.columns)
@@ -978,9 +1094,16 @@ def compute_aov_by_agent(orders_df, start, end):
 
     win = work[_in_range(work[date_col], start, end)]
     salesman_norm = win[salesman_col].astype(str).str.strip()
-    agent_orders = win[~salesman_norm.str.lower().isin(NOT_AGENT_SALESMAN) & (salesman_norm != '') & win[value_col].notna()]
+    agent_orders = win[~salesman_norm.str.lower().isin(NOT_AGENT_SALESMAN) & (salesman_norm != '') & win[value_col].notna()].copy()
     if agent_orders.empty:
         return pd.DataFrame(columns=['Agent', 'Orders', 'AOV', 'Total Value']), None
+
+    fx_rates = {str(k).strip().upper(): v for k, v in (fx_rates or {}).items() if v}
+    has_usd = bool(fx_rates) and market_col is not None
+    if has_usd:
+        rate = agent_orders[market_col].astype(str).str.strip().str.upper().map(fx_rates)
+        agent_orders['_usd_value'] = agent_orders[value_col] / rate
+        agent_orders['_unconverted'] = rate.isna()
 
     # One row per agent (this is "AOV per agent", not per agent-per-market) --
     # Market, if present, is folded in as an informational "Markets" column (the
@@ -994,7 +1117,39 @@ def compute_aov_by_agent(orders_df, start, end):
             lambda s: ', '.join(sorted(set(str(v).strip() for v in s if str(v).strip())))
         ).reset_index().rename(columns={salesman_col: 'Agent', market_col: 'Markets'})
         grouped = grouped.merge(markets, on='Agent', how='left')
+
+    if has_usd:
+        converted = agent_orders[~agent_orders['_unconverted']]
+        if not converted.empty:
+            usd_agg = converted.groupby(salesman_col)['_usd_value'].agg(['count', 'mean', 'sum']).reset_index()
+            usd_agg = usd_agg.rename(columns={
+                salesman_col: 'Agent', 'count': 'Orders (converted)', 'mean': 'AOV (USD)', 'sum': 'Total Value (USD)',
+            })
+            grouped = grouped.merge(usd_agg, on='Agent', how='left')
+        else:
+            grouped['Orders (converted)'] = 0
+            grouped['AOV (USD)'] = np.nan
+            grouped['Total Value (USD)'] = np.nan
+        unconverted_n = int(agent_orders['_unconverted'].sum())
+        if unconverted_n:
+            missing_markets = sorted(set(
+                agent_orders.loc[agent_orders['_unconverted'], market_col].astype(str).str.strip().str.upper()
+            ) - {''})
+        else:
+            missing_markets = []
+        grouped['AOV (USD)'] = grouped['AOV (USD)'].round(2)
+        grouped['Total Value (USD)'] = grouped['Total Value (USD)'].round(2)
+        grouped['vs AOV Target'] = grouped['AOV (USD)'].map(
+            lambda v: (target_badge(v, 'aov_usd') or '—') if pd.notna(v) else '—'
+        )
+
     grouped['AOV'] = grouped['AOV'].round(2)
     grouped['Total Value'] = grouped['Total Value'].round(2)
     grouped = grouped.sort_values('Total Value', ascending=False).reset_index(drop=True)
-    return grouped, None
+
+    diagnostic = None
+    if has_usd and unconverted_n:
+        diagnostic = (f"⚠️ {unconverted_n:,} order(s) in market(s) without a rate set "
+                       f"({', '.join(missing_markets)}) aren't included in the USD columns -- "
+                       f"add a rate for {'them' if len(missing_markets) > 1 else 'it'} in the sidebar to include them.")
+    return grouped, diagnostic
