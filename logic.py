@@ -39,6 +39,18 @@ SCOPES = [
 ]
 GOOGLE_SHEETS_EPOCH = dt.date(1899, 12, 30)
 
+# The only columns this file ever actually reads off the live Calls / Chats tabs (see
+# build_roster, compute_calls, compute_chats below) -- used to fetch just these instead
+# of every column those two tabs have (see _worksheet_to_df_cols/fetch_sheet_data). Both
+# tabs carry several wide free-text columns nothing here uses at all (Call Summary,
+# Closing Note Summary, and more) -- fetching those on every load was most of the actual
+# payload for no benefit.
+CALLS_COLS_USED = ['Agent', 'Created', 'State', 'Handling Duration']
+CHATS_COLS_USED = [
+    'DateTime Conversation Started', 'DateTime Conversation Resolved', 'Contact ID',
+    'Assignee', 'First Response Time', 'Resolution Time', 'Conversation Category',
+]
+
 
 def get_client(service_account_info):
     creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
@@ -377,6 +389,53 @@ def _worksheet_to_df(ws):
     return pd.DataFrame(body, columns=header)
 
 
+
+# Calls and Chats are the two tabs that grow fastest (every call/chat ever handled, plus
+# now the Customer Support native-export uploads append directly into them too) and each
+# carries several wide free-text columns (Call Summary, Closing Note Summary, and more)
+# that nothing in this file actually reads -- see compute_calls/compute_chats/
+# build_roster above for the full list of what's really used. Fetching every column of
+# a tab with tens of thousands of rows just to throw most of it away was the main reason
+# a fresh load ("Reading the live sheet...") could take a long time (confirmed Sep 2026,
+# per Mahmoud -- the live sheet's own xlsx export is 14+ MB). _worksheet_to_df_cols pulls
+# ONLY the named columns, via ONE batched Sheets API request (gspread's batch_get, all
+# ranges in a single HTTP round trip -- not one request per column), instead of the full
+# row width. Agents ID / Schedule / Agents Activity stay on the full-width read: they're
+# either small (Agents ID, Schedule) or already minimal at just 3 columns (Agents
+# Activity) with a chats/calls-style growth curve.
+def _worksheet_to_df_cols(ws, wanted_cols):
+    """Same shape of result as _worksheet_to_df (header row's worth of columns -> a
+    DataFrame), but reads ONLY the columns in wanted_cols that actually exist in the
+    live header -- silently skipping ones that don't (same 'opportunistic' tolerance as
+    the rest of this file already has for a Chats/Calls tab that's missing some column),
+    rather than every column the tab happens to have."""
+    header = ws.row_values(1)
+    if not header:
+        return pd.DataFrame(columns=wanted_cols)
+    header = [str(h).strip() for h in header]
+    present = [c for c in wanted_cols if c in header]
+    if not present:
+        return pd.DataFrame(columns=wanted_cols)
+
+    ranges = [get_column_letter(header.index(c) + 1) + ':' + get_column_letter(header.index(c) + 1)
+              for c in present]
+    results = ws.batch_get(ranges, value_render_option='UNFORMATTED_VALUE')
+
+    columns = {}
+    max_len = 0
+    for col_name, value_range in zip(present, results):
+        col_values = [row[0] if row else None for row in value_range]
+        # First cell of each range is that column's own header -- drop it here, same as
+        # _worksheet_to_df does via values[1:].
+        col_values = col_values[1:] if col_values else []
+        columns[col_name] = col_values
+        max_len = max(max_len, len(col_values))
+
+    for col_name in columns:
+        columns[col_name] += [None] * (max_len - len(columns[col_name]))
+    return pd.DataFrame(columns)
+
+
 def fetch_sheet_data(gc, spreadsheet_id):
     """Reads the live Agents ID / Schedule / Calls / Chats / Agents Activity tabs and
     returns them shaped exactly like pd.ExcelFile(...).parse(tab) would, so they can go
@@ -391,11 +450,11 @@ def fetch_sheet_data(gc, spreadsheet_id):
     if 'Date' in schedule.columns:
         schedule['Date'] = schedule['Date'].map(_serial_to_ts)
 
-    calls = _worksheet_to_df(sh.worksheet('Calls'))
+    calls = _worksheet_to_df_cols(sh.worksheet('Calls'), CALLS_COLS_USED)
     if 'Created' in calls.columns:
         calls['Created'] = calls['Created'].map(_serial_to_ts)
 
-    chats = _worksheet_to_df(sh.worksheet('Chats'))
+    chats = _worksheet_to_df_cols(sh.worksheet('Chats'), CHATS_COLS_USED)
     for c in ('DateTime Conversation Started', 'DateTime Conversation Resolved'):
         if c in chats.columns:
             chats[c] = chats[c].map(_serial_to_ts)
