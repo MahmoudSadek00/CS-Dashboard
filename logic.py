@@ -1184,7 +1184,7 @@ def export_excel(result, comparison=None, sections=None, aov_df=None, period_lab
                             if not isinstance(v, dict)]
             overall_df = pd.DataFrame(scalar_rows)
             ws, hdr, first, last = _write_titled_sheet(
-                writer, overall_df, 'Overall', 'CS Pulse -- Overall', subtitle)
+                writer, overall_df, 'Overall', 'CS Dashboard -- Overall', subtitle)
             # Value column mixes % and non-% metrics -- format only the '_rate' rows.
             for row_idx, rec in zip(range(first, last + 1), scalar_rows):
                 if 'rate' in str(rec['Metric']).lower():
@@ -1192,23 +1192,23 @@ def export_excel(result, comparison=None, sections=None, aov_df=None, period_lab
 
             state_df = pd.DataFrame(list(overall['call_state_totals'].items()), columns=['State', 'Calls'])
             ws2, hdr2, first2, last2 = _write_titled_sheet(
-                writer, state_df, 'Calls by State', 'CS Pulse -- Calls by State', subtitle)
+                writer, state_df, 'Calls by State', 'CS Dashboard -- Calls by State', subtitle)
             _add_bar_chart(ws2, 'Calls by state', cat_col=1, val_col=2, first_data_row=first2,
                             last_data_row=last2, anchor_row=last2 + 3)
 
         if 'Chats' in sections:
-            _write_titled_sheet(writer, result['chats'], 'Chats', 'CS Pulse -- Chats per Agent',
+            _write_titled_sheet(writer, result['chats'], 'Chats', 'CS Dashboard -- Chats per Agent',
                                  subtitle, pct_cols=_PCT_COLS_BY_SHEET['Chats'])
         if 'Calls' in sections:
-            _write_titled_sheet(writer, result['calls'], 'Calls', 'CS Pulse -- Calls per Agent',
+            _write_titled_sheet(writer, result['calls'], 'Calls', 'CS Dashboard -- Calls per Agent',
                                  subtitle, pct_cols=_PCT_COLS_BY_SHEET['Calls'])
         if 'Adherence' in sections:
-            _write_titled_sheet(writer, result['adherence'], 'Adherence', 'CS Pulse -- Adherence per Agent',
+            _write_titled_sheet(writer, result['adherence'], 'Adherence', 'CS Dashboard -- Adherence per Agent',
                                  subtitle, pct_cols=_PCT_COLS_BY_SHEET['Adherence'])
         if aov_df is not None and 'AOV' in sections:
             aov_subtitle = subtitle + (f"    |    {currency_note}" if currency_note else '')
             ws3, hdr3, first3, last3 = _write_titled_sheet(
-                writer, aov_df, 'AOV per Agent', 'CS Pulse -- AOV per Agent', aov_subtitle)
+                writer, aov_df, 'AOV per Agent', 'CS Dashboard -- AOV per Agent', aov_subtitle)
             value_col_name = 'Total Value (USD)' if 'Total Value (USD)' in aov_df.columns else 'Total Value'
             val_col_idx = list(aov_df.columns).index(value_col_name) + 1
             _add_bar_chart(ws3, f'Total order value by agent ({value_col_name})', cat_col=1,
@@ -1216,13 +1216,13 @@ def export_excel(result, comparison=None, sections=None, aov_df=None, period_lab
                             anchor_row=last3 + 3)
         if comparison is not None and 'Comparison' in sections:
             _write_titled_sheet(writer, comparison['overall'], 'Comparison Overall',
-                                 'CS Pulse -- Comparison, Overall', subtitle)
+                                 'CS Dashboard -- Comparison, Overall', subtitle)
             _write_titled_sheet(writer, comparison['chats'], 'Comparison Chats',
-                                 'CS Pulse -- Comparison, Chats', subtitle)
+                                 'CS Dashboard -- Comparison, Chats', subtitle)
             _write_titled_sheet(writer, comparison['calls'], 'Comparison Calls',
-                                 'CS Pulse -- Comparison, Calls', subtitle)
+                                 'CS Dashboard -- Comparison, Calls', subtitle)
             _write_titled_sheet(writer, comparison['adherence'], 'Comparison Adherence',
-                                 'CS Pulse -- Comparison, Adherence', subtitle)
+                                 'CS Dashboard -- Comparison, Adherence', subtitle)
     return buf.getvalue()
 
 
