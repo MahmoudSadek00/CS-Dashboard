@@ -10,9 +10,12 @@ Streamlit tool, adapted to:
     name column at all, only the numeric id)
   - the Bahrain team excluded entirely from scope (their real chat volume belongs to a
     separate BH support queue, not this report)
-  - company policy: on the "4 PM - 12 AM" shift, female agents work from home and it is
-    always counted as a 9-hour shift ending 1 AM, whether or not that day's "Is WFH" flag
-    is set -- gender is inferred from each agent's first name (see FEMALE below)
+  - WFH -> 9-hour shift rule simplified, per Mahmoud (Sep 2026): dropped the old
+    gender-inferred "female agents on 4 PM - 12 AM are always WFH" special case --
+    it had no real basis (nobody could say who decided it) and Mahmoud asked for it
+    gone. Now purely: whatever that day's "Is WFH" flag says (Yes/No, after the
+    existing Fri/Sat/Sun auto-WFH override below) decides the hours -- WFH = 9 hours,
+    not WFH = 8 hours -- for ANY of the three 8-hour-type shifts, not just 4 PM-12 AM
   - the Agents Activity Timestamp column mixing plain-text and Excel-auto-converted
     datetime cells, which silently swaps day/month for the auto-converted ones unless
     corrected (fix_activity_ts)
@@ -64,13 +67,6 @@ BAHRAIN = {'Sayed Hadi Alwedaei', 'Fatima Hassan', 'Zainab Abbas', 'Mahdi Ali'}
 
 TEAM_OVERRIDE = {
     'Heba Tarek': 'Logistics', 'Mayar Khaled': 'Logistics', 'Nada Esaam': 'Logistics',
-}
-
-# Gender inferred from first name, per Mahmoud -- used only for the 4PM-12AM WFH rule.
-FEMALE = {
-    'Nariman Shedid', 'Naira Emad', 'Waad Yassin', 'Heba Tarek', 'Mayar Khaled',
-    'Nada Esaam', 'Duha Younis', 'Hagar Ahmed', 'Nada Sayed', 'Salma Adel',
-    'Sondos Tarik', 'Basma Mostafa', 'Sara Hussien', 'Samaa Ahmed', 'Hagar Shaban',
 }
 
 # canonical Agents-ID name -> known alternate spellings in Calls / Agents Activity
@@ -627,7 +623,6 @@ def compute_adherence(data, start, end):
         if a_sched.empty:
             continue
         intervals = agent_intervals.get(agent, [])
-        is_female = agent in FEMALE
 
         for _, srow in a_sched.iterrows():
             day_dt = srow['Date']
@@ -655,8 +650,13 @@ def compute_adherence(data, start, end):
 
             win_start, win_end = shift_window(shift_label, day_dt)
             planned = SHIFT_PLANNED_MIN[shift_label]
+            # WFH -> 9-hour rule, per Mahmoud (Sep 2026): purely driven by that day's Is WFH
+            # flag now (the old "female agent on 4 PM-12 AM = always WFH" special case is
+            # gone -- no real basis for it was ever found, see module docstring). WFH = 9
+            # hours (480 planned), not WFH = 8 hours (420, the SHIFT_PLANNED_MIN default
+            # already set above) -- for any of the three 8-hour-type shifts, not just 4 PM-12 AM.
             nine_hour = False
-            if shift_label in EIGHT_HOUR_TYPES and (is_wfh or (is_female and shift_label == '4 PM - 12 AM')):
+            if shift_label in EIGHT_HOUR_TYPES and is_wfh:
                 nine_hour = True
                 win_end = win_end + pd.Timedelta(hours=1)
                 planned = 480
