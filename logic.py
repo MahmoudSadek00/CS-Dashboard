@@ -242,7 +242,13 @@ def to_timedelta(s):
 
 
 def fmt_td(td):
-    if td is None or (isinstance(td, float) and pd.isna(td)):
+    # pd.isna() catches None, a plain float NaN, AND pd.NaT in one shot -- the old
+    # check here only caught the first two, so pd.NaT (e.g. _mean_td_nonblank's
+    # "nothing qualified" return, whenever EVERY conversation for an agent still
+    # lacks a value for that time metric -- a normal case on real data, not rare)
+    # slipped through into int(td.total_seconds()), which is nan for NaT -> crashed
+    # the whole app with "cannot convert float NaN to integer".
+    if pd.isna(td):
         return ''
     total_sec = int(td.total_seconds())
     sign = '-' if total_sec < 0 else ''
