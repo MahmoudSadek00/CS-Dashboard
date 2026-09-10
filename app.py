@@ -1,5 +1,6 @@
 import datetime as dt
 import json
+import traceback
 
 import pandas as pd
 import streamlit as st
@@ -177,6 +178,13 @@ with st.spinner("Reading the live sheet and crunching the numbers..."):
             f"Couldn't read the spreadsheet: {e}\n\nMost likely cause: the service "
             "account isn't shared as a Viewer on this specific sheet yet -- see the README."
         )
+        # The one-line message above is a GUESS at the most common cause (permissions),
+        # but plenty of errors here are actually a data-shape issue further down the
+        # pipeline (e.g. a blank cell where a number's expected) that guess doesn't
+        # explain at all -- so the real traceback is shown too, not hidden, so this is
+        # self-diagnosable without a back-and-forth every time.
+        with st.expander("Full error details (for diagnosing anything other than a permissions issue)"):
+            st.code(traceback.format_exc())
         st.stop()
 
 comparison = None
