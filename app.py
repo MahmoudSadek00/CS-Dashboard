@@ -9,7 +9,7 @@ import plotly.io as pio
 
 import logic
 
-st.set_page_config(page_title="CS Pulse", layout="wide")
+st.set_page_config(page_title="CS Dashboard", layout="wide")
 
 # Same dark, bordered-tile look as Ops Pulse (see .streamlit/config.toml for the base
 # theme colors) -- kept identical on purpose so this reads as the same product family.
@@ -49,7 +49,7 @@ st.markdown("""
 
 pio.templates.default = "plotly_dark"
 
-st.title("CS Pulse")
+st.title("CS Dashboard")
 st.caption("Customer Support performance -- Chats, Calls and Adherence, company-wide and per agent.")
 
 # Serviced and Successful are merged into one "Serviced" bucket in logic.py.
@@ -408,7 +408,7 @@ with st.sidebar:
     ) if export_sections else None
     st.download_button(
         "⬇️ Download report (.xlsx)", data=export_bytes or b"",
-        file_name=f"cs_pulse_{start:%Y%m%d}_to_{end:%Y%m%d}.xlsx",
+        file_name=f"cs_dashboard_{start:%Y%m%d}_to_{end:%Y%m%d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         disabled=not export_sections, use_container_width=True,
     )
