@@ -205,6 +205,13 @@ if enable_comparison:
 overall = result['overall']
 chats_df = result['chats']
 calls_df = result['calls']
+# Inbound/Outbound split, added Sep 2026 per Mahmoud -- both always shown together
+# further down (no toggle), on top of the combined calls_df above which the Overall
+# cards/chart and the main "Calls -- per agent" table keep using as-is.
+calls_inbound_df = result['calls_inbound']
+calls_inbound_totals = result['calls_inbound_totals']
+calls_outbound_df = result['calls_outbound']
+calls_outbound_totals = result['calls_outbound_totals']
 adherence_df = result['adherence']
 unclassified = result['unclassified_shifts']
 daily_audit = result['daily_audit']
@@ -262,9 +269,15 @@ with c8:
             st.caption("Share of the combined Busy-calls + chat-handling minutes behind "
                        "the Occupancy % above (company-wide, this period).")
 
-c9, c10, _c11, _c12 = st.columns(4)
+c9, c10, c11, _c12 = st.columns(4)
 c9.metric("Avg. Shrinkage", _pct(overall['avg_shrinkage']))
 c10.metric("Agents in Scope", f"{overall['agents_in_scope']}")
+c11.metric(
+    "Avg. Handling Time", overall['avg_handling_time'] or "--",
+    help="Average Handling Duration across every Serviced call in the period, company-wide "
+         "(Inbound + Outbound combined -- see the Inbound vs Outbound Calls section below "
+         "for the two split out separately).",
+)
 
 st.subheader("Calls by state")
 state_totals = overall['call_state_totals']
@@ -420,6 +433,8 @@ def _filter_agents(df):
 
 chats_df_view = _filter_agents(chats_df)
 calls_df_view = _filter_agents(calls_df)
+calls_inbound_df_view = _filter_agents(calls_inbound_df)
+calls_outbound_df_view = _filter_agents(calls_outbound_df)
 adherence_df_view = _filter_agents(adherence_df)
 
 # ---------------------------------------------------------------------------
@@ -451,6 +466,64 @@ else:
             'Avg per day': st.column_config.NumberColumn(format="%.2f"),
         },
     )
+
+# ---------------------------------------------------------------------------
+# Calls -- Inbound vs Outbound (added Sep 2026, per Mahmoud). Both blocks are
+# always shown together side by side -- no toggle to switch between them --
+# so Inbound support-call volume and Outbound follow-up-call volume never get
+# blended into one number here, the way the combined table above still does
+# on purpose (that one stays as the "everything" view). Each block reuses the
+# exact same compute_calls() logic as the combined table, just pre-filtered
+# by Direction, so there's no separate calculation to drift out of sync.
+# ---------------------------------------------------------------------------
+st.header("Calls -- Inbound vs Outbound")
+
+
+def _render_calls_direction_block(label, totals, df_view):
+    st.subheader(label)
+    n1, n2, n3, n4 = st.columns(4)
+    n1.metric("Total Calls", f"{totals['total_calls']:,}")
+    n2.metric("Answered Rate", _pct(totals['answered_rate']))
+    dropped_rate = (round(totals['state_totals']['Dropped'] / totals['total_calls'] * 100, 1)
+                    if totals['total_calls'] else None)
+    n3.metric("Dropped Rate", _pct(dropped_rate))
+    n4.metric("Avg Handling Time", totals['avg_handling_time'] or "--")
+
+    state_totals = totals['state_totals']
+    state_total_n = sum(state_totals.values())
+    if state_total_n:
+        labels = [
+            f"{v:,} ({v / state_total_n * 100:.1f}%)" if state_total_n else f"{v:,}"
+            for v in state_totals.values()
+        ]
+        fig = go.Figure(go.Bar(
+            x=list(state_totals.values()), y=list(state_totals.keys()), orientation='h',
+            marker_color=[STATE_COLORS[s] for s in state_totals], text=labels,
+            textposition='outside', hovertemplate='%{y}: %{x:,}<extra></extra>',
+        ))
+        fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10),
+                           xaxis_title="Calls", yaxis_title=None)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.caption(f"No {label.lower()} calls in this period.")
+
+    if df_view.empty:
+        st.caption(f"No {label.lower()} call data matched the roster (or the agent filter) in this period.")
+    else:
+        st.dataframe(
+            df_view, use_container_width=True, hide_index=True,
+            column_config={
+                'Answered %': st.column_config.NumberColumn(format="%.1f%%"),
+                'Avg per day': st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+
+
+col_in, col_out = st.columns(2)
+with col_in:
+    _render_calls_direction_block("Inbound", calls_inbound_totals, calls_inbound_df_view)
+with col_out:
+    _render_calls_direction_block("Outbound", calls_outbound_totals, calls_outbound_df_view)
 
 # ---------------------------------------------------------------------------
 # Adherence -- per agent
