@@ -152,6 +152,12 @@ CALL_STATE_NORMALIZE = {'Successful': 'Serviced'}
 CALL_STATES = ['Serviced', 'Dropped', 'No Answer', 'Abandoned', 'Blocked', 'Busy', 'Failed']
 CALL_ANSWERED_STATES = {'Serviced'}
 
+# Inbound/Outbound split, added Sep 2026 per Mahmoud -- the raw Calls tab's "Type"
+# column is already exactly this (values seen: "Inbound"/"Outbound"), normalized
+# the same way State is (strip + title-case) so a stray extra space or lowercase
+# entry doesn't silently fall outside both buckets.
+CALL_DIRECTIONS = ['Inbound', 'Outbound']
+
 FCR_WINDOW_DAYS = 7
 
 # ---------------------------------------------------------------------------
@@ -361,6 +367,13 @@ def build_roster(agents, schedule, calls, chats, activity):
     calls['Agent_n'] = calls['Agent'].map(norm)
     calls['Created'] = pd.to_datetime(calls['Created'], errors='coerce')
     calls['State'] = calls['State'].astype(str).str.strip().map(lambda s: CALL_STATE_NORMALIZE.get(s, s))
+    # Inbound/Outbound, added Sep 2026 per Mahmoud -- see CALL_DIRECTIONS above. Anything
+    # that doesn't normalize to exactly "Inbound"/"Outbound" (blank, a typo, a value this
+    # export never had before) stays as whatever it normalized to rather than getting
+    # silently dropped -- it just won't match either direction filter in compute_calls,
+    # so it's still visible in the combined (direction=None) totals, only missing from
+    # both split blocks. Worth a look if the Inbound+Outbound counts stop summing to Total.
+    calls['Direction'] = calls['Type'].astype(str).str.strip().str.title()
 
     chats = chats.copy()
     chats['DateTime Conversation Started'] = pd.to_datetime(chats['DateTime Conversation Started'], errors='coerce')
@@ -860,10 +873,17 @@ def compute_chats(data, start, end, denom_days):
 # ---------------------------------------------------------------------------
 # Calls
 # ---------------------------------------------------------------------------
-def compute_calls(data, start, end, denom_days):
+def compute_calls(data, start, end, denom_days, direction=None):
     calls = data['calls']
     roster = data['full_roster']
     win = calls[_in_range(calls['Created'], start, end)].copy()
+    # Inbound/Outbound split, added Sep 2026 per Mahmoud -- direction=None (the default,
+    # used for the combined Overall cards and the AHT card) keeps every call; pass
+    # 'Inbound' or 'Outbound' to scope everything below (per-agent table AND the
+    # company-wide totals dict) to just that direction. Same function either way, so the
+    # two split blocks in the app can never drift from the logic the combined view uses.
+    if direction is not None:
+        win = win[win['Direction'] == direction]
     win['handle_td'] = win['Handling Duration'].map(to_timedelta)
     win_scoped = win[win['canonical'].isin(roster)].copy()
 
@@ -904,9 +924,18 @@ def compute_calls(data, start, end, denom_days):
     answered_rate_all = round(answered_all / total_calls_all * 100, 1) if total_calls_all else None
     unattributed = int((~win['canonical'].isin(roster)).sum())
 
+    # Company-wide AHT (added Sep 2026, per Mahmoud -- new top-level card) -- same
+    # "every call in the period, not just the per-agent table" scope as the other
+    # _all figures above, and the same averaged-over-Serviced-calls-only definition
+    # already used per-agent (see 'Avg Handling Time' in the per-agent loop above).
+    answered_mask_all = win['State'].isin(CALL_ANSWERED_STATES)
+    avg_handle_all = win.loc[answered_mask_all, 'handle_td'].mean() if answered_mask_all.any() else None
+    aht_all = fmt_td(avg_handle_all) if avg_handle_all is not None else None
+
     calls_totals = {
         'state_totals': state_totals_all, 'total_calls': total_calls_all,
         'answered_rate': answered_rate_all, 'unattributed_calls': unattributed,
+        'avg_handling_time': aht_all,
     }
     return calls_df, calls_totals
 
@@ -927,6 +956,9 @@ def compute_overall(chats_df, calls_df, calls_totals, adherence_df):
     o['answered_rate'] = calls_totals['answered_rate']
     o['call_state_totals'] = calls_totals['state_totals']
     o['unattributed_calls'] = calls_totals['unattributed_calls']
+    # AHT card, added Sep 2026 per Mahmoud -- one company-wide number (not split by
+    # Inbound/Outbound, unlike the Calls section below -- confirmed with Mahmoud).
+    o['avg_handling_time'] = calls_totals.get('avg_handling_time')
     state_totals = calls_totals['state_totals']
     o['dropped_rate'] = (round(state_totals['Dropped'] / o['total_calls'] * 100, 1)
                           if o['total_calls'] else None)
@@ -972,9 +1004,16 @@ def build_report_from_data(data, start, end):
     denom_days = {a: days_lookup.get(a, calendar_days) or calendar_days for a in data['full_roster']}
     chats_df, unmatched_chat_ids, chat_category_totals = compute_chats(data, start, end, denom_days)
     calls_df, calls_totals = compute_calls(data, start, end, denom_days)
+    # Inbound/Outbound split, added Sep 2026 per Mahmoud -- both blocks always computed
+    # and shown together in the app (no toggle), on top of the combined calls_df/
+    # calls_totals above which stay as-is for the existing Overall cards/chart.
+    calls_inbound_df, calls_inbound_totals = compute_calls(data, start, end, denom_days, direction='Inbound')
+    calls_outbound_df, calls_outbound_totals = compute_calls(data, start, end, denom_days, direction='Outbound')
     overall = compute_overall(chats_df, calls_df, calls_totals, adherence_df)
     return {
         'data': data, 'overall': overall, 'chats': chats_df, 'calls': calls_df,
+        'calls_inbound': calls_inbound_df, 'calls_inbound_totals': calls_inbound_totals,
+        'calls_outbound': calls_outbound_df, 'calls_outbound_totals': calls_outbound_totals,
         'adherence': adherence_df, 'daily_audit': daily_df, 'unclassified_shifts': unclassified_df,
         'unmatched_chat_ids': unmatched_chat_ids, 'unattributed_calls': calls_totals['unattributed_calls'],
         'chat_category_totals': chat_category_totals,
@@ -1202,6 +1241,15 @@ def export_excel(result, comparison=None, sections=None, aov_df=None, period_lab
         if 'Calls' in sections:
             _write_titled_sheet(writer, result['calls'], 'Calls', 'CS Dashboard -- Calls per Agent',
                                  subtitle, pct_cols=_PCT_COLS_BY_SHEET['Calls'])
+            # Inbound/Outbound split, added Sep 2026 per Mahmoud -- same per-agent shape
+            # as the combined 'Calls' sheet above, just pre-filtered by Direction, so the
+            # export mirrors the two always-shown blocks in the app.
+            _write_titled_sheet(writer, result['calls_inbound'], 'Calls (Inbound)',
+                                 'CS Dashboard -- Calls per Agent, Inbound', subtitle,
+                                 pct_cols=_PCT_COLS_BY_SHEET['Calls'])
+            _write_titled_sheet(writer, result['calls_outbound'], 'Calls (Outbound)',
+                                 'CS Dashboard -- Calls per Agent, Outbound', subtitle,
+                                 pct_cols=_PCT_COLS_BY_SHEET['Calls'])
         if 'Adherence' in sections:
             _write_titled_sheet(writer, result['adherence'], 'Adherence', 'CS Dashboard -- Adherence per Agent',
                                  subtitle, pct_cols=_PCT_COLS_BY_SHEET['Adherence'])
