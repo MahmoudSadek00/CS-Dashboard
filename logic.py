@@ -48,7 +48,7 @@ GOOGLE_SHEETS_EPOCH = dt.date(1899, 12, 30)
 # tabs carry several wide free-text columns nothing here uses at all (Call Summary,
 # Closing Note Summary, and more) -- fetching those on every load was most of the actual
 # payload for no benefit.
-CALLS_COLS_USED = ['Agent', 'Created', 'State', 'Handling Duration']
+CALLS_COLS_USED = ['Agent', 'Created', 'State', 'Handling Duration', 'Type']
 CHATS_COLS_USED = [
     'DateTime Conversation Started', 'DateTime Conversation Resolved', 'Contact ID',
     'Assignee', 'First Response Time', 'Resolution Time', 'Conversation Category',
@@ -373,7 +373,16 @@ def build_roster(agents, schedule, calls, chats, activity):
     # silently dropped -- it just won't match either direction filter in compute_calls,
     # so it's still visible in the combined (direction=None) totals, only missing from
     # both split blocks. Worth a look if the Inbound+Outbound counts stop summing to Total.
-    calls['Direction'] = calls['Type'].astype(str).str.strip().str.title()
+    # Opportunistic like several other columns in this file (e.g. Delivery Date, chats'
+    # First Response Time): the live-sheets path only fetches the columns listed in
+    # CALLS_COLS_USED (see that list above -- 'Type' was missing from it at first, which
+    # crashed the whole app with KeyError: 'Type' instead of degrading gracefully; fixed
+    # by adding it there AND here, so a future rename/removal on the live Calls tab fails
+    # soft -- Direction just comes back blank -- rather than taking the app down again).
+    if 'Type' in calls.columns:
+        calls['Direction'] = calls['Type'].astype(str).str.strip().str.title()
+    else:
+        calls['Direction'] = None
 
     chats = chats.copy()
     chats['DateTime Conversation Started'] = pd.to_datetime(chats['DateTime Conversation Started'], errors='coerce')
