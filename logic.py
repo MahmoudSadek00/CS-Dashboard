@@ -14,10 +14,14 @@ Streamlit tool, adapted to:
     gender-inferred "female agents on 4 PM - 12 AM are always WFH" special case, for
     lacking a clear basis -- then, Sep 15 2026, Mahmoud explicitly reinstated a version
     of it (standing, every day, not just Fri/Sat/Sun) plus a second new standing rule:
-    the overnight 12 AM-9 AM shift is WFH for everyone. See MALE_AGENTS /
-    WFH_ALWAYS_SHIFT_ALL / WFH_ALWAYS_SHIFT_NON_MALE below for the exact current rules --
-    they combine with the Schedule's own "Is WFH" flag and the Fri/Sat/Sun override
-    (whichever fires first wins; multiple can apply to the same day).
+    the overnight 12 AM-9 AM shift is WFH for everyone. See WFH_ALWAYS_SHIFT_ALL /
+    WFH_ALWAYS_SHIFT_NON_MALE below for the exact current rules -- they combine with the
+    Schedule's own "Is WFH" flag and the Fri/Sat/Sun default (whichever fires first wins;
+    multiple can apply to the same day). Sep 16 2026, per Mahmoud: the "non-male" half of
+    that rule now reads a live "Gender" column he added to the Agents ID tab (see
+    `gender_lookup` in build_roster / compute_adherence) instead of a hardcoded name list,
+    and the Fri/Sat/Sun default now only fires when the Schedule's Is WFH cell was blank
+    for that day -- an explicit "No" is respected, not overridden.
   - the Agents Activity Timestamp column mixing plain-text and Excel-auto-converted
     datetime cells, which silently swaps day/month for the auto-converted ones unless
     corrected (fix_activity_ts)
@@ -132,26 +136,29 @@ SHIFT_PLANNED_MIN = {
 }
 EIGHT_HOUR_TYPES = {'9 AM - 5 PM', '11 AM - 7 PM', '4 PM - 12 AM'}
 
-# Company policy, per Mahmoud (Sep 2026): on Friday/Saturday/Sunday, ANY real working
-# shift (Day Off/leave excluded, same NON_WORKING check as everywhere else) is treated
-# as work-from-home regardless of what the Schedule's "Is WFH" column literally says --
-# even overriding an explicit "No" there. Every day this override actually changes the
-# flag (i.e. the sheet didn't already say WFH=Yes) is tracked in daily_audit ('WFH
-# Overridden' column) and surfaced in the Diagnostics tab, so a "No" in the raw sheet
-# being silently treated as WFH stays visible/auditable rather than a silent overwrite.
+# Company policy, per Mahmoud (Sep 2026, REVISED Sep 16 2026): on Friday/Saturday/Sunday,
+# a real working shift (Day Off/leave excluded, same NON_WORKING check as everywhere
+# else) DEFAULTS to work-from-home only when the Schedule's "Is WFH" column was actually
+# left blank that day. An explicit "No" in the sheet is respected, not overridden -- the
+# original Sep 2026 version forced WFH=Yes on a weekend even over an explicit "No"; Mahmoud
+# walked that back once the Schedule started reliably having a real Yes/No either way, not
+# just gaps. Every day this default actually changes the flag (i.e. the cell was blank) is
+# tracked in daily_audit ('WFH Overridden' column) and surfaced in the Diagnostics tab.
 WFH_OVERRIDE_WEEKDAYS = {'Friday', 'Saturday', 'Sunday'}
 
 # Sep 15 2026, per Mahmoud -- re-adds, on his explicit direct confirmation, a narrower
 # version of the "female agents on 4 PM-12 AM are always WFH" rule the module docstring
-# above says he had previously asked removed for lacking a clear basis. This time it's
-# a standing (every day, not just Fri/Sat/Sun) rule and Mahmoud named the exclusion list
-# himself rather than it being inferred from names -- MALE_AGENTS are the only agents
-# NOT covered by it; every other roster agent (incl. Waad Yassin, confirmed explicitly)
-# on a 4 PM-12 AM shift is WFH. He also named a second, gender-independent standing rule
-# in the same breath: the overnight 12 AM-9 AM shift is WFH for EVERYONE, always -- this
-# one doesn't change Planned Minutes (that shift is already 480 via SHIFT_PLANNED_MIN,
-# not one of EIGHT_HOUR_TYPES), it only makes the WFH flag/tracking accurate.
-MALE_AGENTS = {'Ahmed Ashraf', 'Ramy Maher', 'Hassan Badawy', 'Muhammed Hesham', 'Mohamed Sayed'}
+# above says he had previously asked removed for lacking a clear basis. This time it's a
+# standing (every day, not just Fri/Sat/Sun) rule -- every roster agent NOT read as 'male'
+# from the live Gender lookup (incl. Waad Yassin, confirmed explicitly) on a 4 PM-12 AM
+# shift is WFH. Originally (Sep 15) driven by a hardcoded MALE_AGENTS name list Mahmoud
+# dictated directly; REVISED Sep 16 2026 to read a live "Gender" column he added to the
+# Agents ID tab instead (see `gender_lookup` in build_roster), so a new hire's coverage
+# comes from the sheet, not a code change. He also named a second, gender-independent
+# standing rule in the same Sep 15 breath: the overnight 12 AM-9 AM shift is WFH for
+# EVERYONE, always -- this one doesn't change Planned Minutes (that shift is already 480
+# via SHIFT_PLANNED_MIN, not one of EIGHT_HOUR_TYPES), it only makes the WFH flag/tracking
+# accurate.
 WFH_ALWAYS_SHIFT_ALL = {'12 AM - 9 AM'}
 WFH_ALWAYS_SHIFT_NON_MALE = {'4 PM - 12 AM'}
 
@@ -401,6 +408,21 @@ def build_roster(agents, schedule, calls, chats, activity):
     agents = agents.copy()
     agents['Agent Name'] = agents['Agent Name'].astype(str).str.strip()
     agents = agents[~agents['Agent Name'].isin(BAHRAIN)].reset_index(drop=True)
+    # Gender column, added Sep 2026 per Mahmoud directly on the Agents ID tab -- read
+    # BEFORE the Agent ID cleanup below so someone without an ID yet still gets a gender
+    # entry. Replaces the old hardcoded MALE_AGENTS list for the 4 PM-12 AM WFH rule (see
+    # compute_adherence) -- a new hire's gender now comes from the sheet, no code change
+    # needed. An agent missing from this lookup entirely (e.g. off-roster, not on the
+    # Agents ID tab at all -- see off_roster below) falls back to the same "not male"
+    # default the old hardcoded list already implied for anyone it didn't name.
+    if 'Gender' in agents.columns:
+        gender_lookup = {
+            name: str(g).strip().lower()
+            for name, g in zip(agents['Agent Name'], agents['Gender'])
+            if pd.notna(g) and str(g).strip()
+        }
+    else:
+        gender_lookup = {}
     agents['Team'] = agents.get('Team')
     if agents['Team'].isna().all():
         agents['Team'] = agents['Agent Name'].map(lambda n: TEAM_OVERRIDE.get(n, 'CS'))
@@ -478,8 +500,16 @@ def build_roster(agents, schedule, calls, chats, activity):
     schedule['Shift'] = schedule['Shift'].astype(str).str.strip().map(lambda s: SHIFT_NORMALIZE.get(s, s))
     if 'Is WFH' in schedule.columns:
         schedule['is_wfh_flag'] = schedule['Is WFH'].astype(str).str.strip().str.lower().eq('yes')
+        # Raw tri-state alongside the boolean above -- '' means the cell was blank/missing,
+        # distinct from an explicit 'no'. Needed for the Fri/Sat/Sun default below (Sep 16
+        # 2026, per Mahmoud): blank on a weekend defaults to WFH=Yes, but an explicit "No"
+        # in the sheet is respected, not overridden -- the plain boolean above can't tell
+        # those two apart (both read as False), so this keeps the distinction available.
+        schedule['wfh_raw'] = schedule['Is WFH'].apply(
+            lambda v: '' if pd.isna(v) else str(v).strip().lower())
     else:
         schedule['is_wfh_flag'] = False
+        schedule['wfh_raw'] = ''
 
     # Excuse Minutes / Note, added Sep 15 2026 per Mahmoud -- two columns he asked to sit
     # directly on Schedule, next to Is WFH: a manager-approved excuse/lost-time number in
@@ -522,6 +552,7 @@ def build_roster(agents, schedule, calls, chats, activity):
         'activity': activity, 'roster': roster, 'off_roster': off_roster,
         'agents_missing_id': agents_missing_id,
         'full_roster': full_roster, 'id_to_name': id_to_name,
+        'gender': gender_lookup,
     }
 
 
@@ -695,6 +726,7 @@ def compute_adherence(data, start, end):
     activity = data['activity']
     chats = data['chats']
     roster = data['full_roster']
+    gender_lookup = data.get('gender', {})
 
     sched_win = schedule[_in_range(schedule['Date'], start, end)].copy()
     act_win = activity[activity['ts'].notna()].copy()
@@ -752,6 +784,7 @@ def compute_adherence(data, start, end):
             day_dt = srow['Date']
             shift_label = srow['Shift']
             is_wfh = bool(srow['is_wfh_flag'])
+            wfh_raw = srow.get('wfh_raw', '')
 
             if shift_label in UNRESOLVED_LABELS:
                 unclassified_days.append({'Agent': agent, 'Date': day_dt, 'Shift': shift_label})
@@ -766,20 +799,30 @@ def compute_adherence(data, start, end):
                 })
                 continue
 
-            # Fri/Sat/Sun WFH override -- see WFH_OVERRIDE_WEEKDAYS above. Only reached
-            # for a genuine working shift (Day Off/leave already excluded above).
+            # Fri/Sat/Sun WFH default -- see WFH_OVERRIDE_WEEKDAYS above. REVISED Sep 16
+            # 2026, per Mahmoud: only defaults to WFH when the Schedule's Is WFH cell was
+            # actually blank for that day -- an explicit "No" is now respected, not
+            # overridden (the old version forced WFH=Yes on a weekend even over an
+            # explicit "No"). `wfh_raw` is '' for blank/missing, distinct from 'no'. Only
+            # reached for a genuine working shift (Day Off/leave already excluded above).
             wfh_overridden = False
-            if not is_wfh and day_dt.day_name() in WFH_OVERRIDE_WEEKDAYS:
+            if not is_wfh and day_dt.day_name() in WFH_OVERRIDE_WEEKDAYS and wfh_raw == '':
                 is_wfh = True
                 wfh_overridden = True
             # Standing shift-based WFH overrides, per Mahmoud (Sep 15 2026) -- see
-            # MALE_AGENTS / WFH_ALWAYS_SHIFT_* above. Independent of the weekday
-            # override above (either can flip it; wfh_overridden just records that
-            # SOME override fired when the raw sheet said No).
+            # WFH_ALWAYS_SHIFT_* above. Independent of the weekday override above (either
+            # can flip it; wfh_overridden just records that SOME override fired when the
+            # raw sheet said No).
             if not is_wfh and shift_label in WFH_ALWAYS_SHIFT_ALL:
                 is_wfh = True
                 wfh_overridden = True
-            if not is_wfh and shift_label in WFH_ALWAYS_SHIFT_NON_MALE and agent not in MALE_AGENTS:
+            # Gender-driven, not a hardcoded name list -- revised Sep 16 2026, per Mahmoud,
+            # who added a live "Gender" column to the Agents ID tab specifically so this
+            # rule reads from the sheet instead of needing a code change per new hire. An
+            # agent missing from gender_lookup entirely (off-roster, not on Agents ID at
+            # all) falls back to the same "not male" default the old hardcoded list
+            # already implied for anyone it didn't explicitly name.
+            if not is_wfh and shift_label in WFH_ALWAYS_SHIFT_NON_MALE and gender_lookup.get(agent) != 'male':
                 is_wfh = True
                 wfh_overridden = True
 
@@ -802,7 +845,9 @@ def compute_adherence(data, start, end):
             # excuses reduce PLANNED minutes, they are not added to Actual. Floored at 0 so
             # a bad/oversized manual entry can't flip Planned negative. This intentionally
             # runs AFTER the WFH nine_hour bump above, so an excuse on a WFH day reduces
-            # from 480, not from the un-bumped 420/8-hour figure.
+            # from 480, not the un-bumped 420/8-hour figure. (Sep 16 2026: a same-day cap
+            # at the real Actual-vs-Planned shortfall was tried and then reverted, per
+            # Mahmoud -- back to reducing Planned by the excuse's full stated value.)
             excuse_min = float(srow.get('excuse_minutes', 0.0) or 0.0)
             _raw_note = srow.get('excuse_note', '')
             excuse_note = '' if pd.isna(_raw_note) else str(_raw_note).strip()
