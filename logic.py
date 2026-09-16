@@ -161,6 +161,20 @@ TRAINING_STATE = 'Away - training'
 TECH_STATE = 'Away - technical issue'
 OFFLINE_STATE = 'Offline'
 RECLASS_STATES = BREAK_STATES | {COACHING_STATE, TRAINING_STATE}
+# Max length (minutes) of an Offline gap that can still be bridged into the
+# identical state sitting on both sides of it (see the reclassify step in
+# compute_adherence). Sep 2026, per Mahmoud, from a real case: Muhammed Hesham,
+# 13 Aug -- a genuine ~5-hour Offline gap (09:00-14:12) got bridged into "Away -
+# coaching" purely because a few-second coaching blip happened to sit on each
+# side of it, which is not remotely a real coaching session. Real bridgeable
+# gaps in the Aug 2026 data (a brief reconnect blip mid-break/coaching/training)
+# topped out well under this; the one clear outlier was 311 minutes.
+RECLASS_MAX_GAP_MINUTES = 90
+# A label for Offline time that Chats prove was real work -- see
+# _fill_offline_with_chat below. Deliberately distinct from 'Available' (not
+# folded into it at the source) so the daily/agent breakdown can still show how
+# many minutes came from genuine Maqsam presence vs. this fallback.
+CHAT_BACKED_STATE = 'Available (Chat, no Maqsam)'
 
 # Serviced and Successful merged into one "Serviced" bucket, per Mahmoud (Sep 2026) --
 # the platform's own docs draw no real distinction Ops needs to track separately.
@@ -317,6 +331,41 @@ def _overlap_minutes(a_intervals, b_intervals):
             if ce > cs:
                 total += (ce - cs).total_seconds() / 60
     return total
+
+
+def _fill_offline_with_chat(clipped, chat_ivs, label):
+    """Real, evidenced chat-handling time inside an Offline stretch is not really
+    "not present" -- it means Maqsam/Agents Activity has a gap (no presence log
+    at all) while the agent was demonstrably working via chat instead. Confirmed
+    Sep 2026, per Mahmoud, on two real cases: Sara Hussien, 17-18 Aug (zero
+    Agents Activity rows either day, but 69 and 76 resolved chats spanning the
+    whole shift) and Muhammed Hesham, 13 Aug (a ~5-hour Agents Activity gap with
+    54 chats resolved inside it). Any portion of an Offline interval that
+    overlaps a chat conversation window [Started, Resolved] is relabeled
+    `label` instead of staying Offline; the rest of the Offline interval (no
+    chat evidence either) is left alone. `chat_ivs` must be pre-sorted,
+    non-overlapping (start, end) tuples, already clipped to the shift window --
+    see `_merge_intervals` and the `chat_clipped` list built in
+    compute_adherence."""
+    if not chat_ivs:
+        return clipped
+    out = []
+    for s, e, st in clipped:
+        if st != OFFLINE_STATE:
+            out.append([s, e, st])
+            continue
+        cursor = s
+        for cs, ce in chat_ivs:
+            os_, oe_ = max(cs, s), min(ce, e)
+            if oe_ <= os_:
+                continue
+            if os_ > cursor:
+                out.append([cursor, os_, OFFLINE_STATE])
+            out.append([os_, oe_, label])
+            cursor = max(cursor, oe_)
+        if cursor < e:
+            out.append([cursor, e, OFFLINE_STATE])
+    return out
 
 
 def fix_activity_ts(v):
@@ -623,7 +672,21 @@ def shift_window(shift_label, day_dt):
     if shift_label == '4 PM - 12 AM':
         return day_dt + pd.Timedelta(hours=16), day_dt + pd.Timedelta(hours=24)
     if shift_label == '12 AM - 9 AM':
-        return day_dt, day_dt + pd.Timedelta(hours=9)
+        # Overnight Convention (verified against the old manually-built report's
+        # Methodology sheet, Sep 2026): a "12 AM - 9 AM" shift dated D on the
+        # Schedule actually runs from 12:00 AM to 9:00 AM on D+1, not on D itself
+        # -- Maqsam logs the login under the calendar day it actually happens,
+        # which for a midnight-start shift is always the NEXT day relative to the
+        # Schedule's "Date" cell. Anchoring the window to D instead (the old,
+        # buggy behavior) queried an empty stretch of D 00:00-09:00 and silently
+        # orphaned the agent's real D+1 00:00-09:00 session -- misattributing the
+        # first day of an overnight streak as ~0 Actual Minutes, and dropping the
+        # true activity of the streak's last day entirely if D+1 wasn't itself
+        # scheduled as a working day. The row is still labeled/reported under
+        # the original Schedule date D (see 'Date': day_dt below) -- only the
+        # window used to pull real activity is shifted to D+1.
+        next_day = day_dt + pd.Timedelta(days=1)
+        return next_day, next_day + pd.Timedelta(hours=9)
     return None, None
 
 
@@ -746,18 +809,46 @@ def compute_adherence(data, start, end):
             planned = max(0.0, planned - excuse_min)
 
             data_status = 'Complete' if win_end <= cutoff else 'Incomplete*'
-            clipped = clip(intervals, win_start, min(win_end + pd.Timedelta(hours=12), win_end + pd.Timedelta(hours=1)))
-            # reclassify short Offline gaps sandwiched between identical break/coaching/training states
+            window_clip_end = min(win_end + pd.Timedelta(hours=12), win_end + pd.Timedelta(hours=1))
+            clipped = clip(intervals, win_start, window_clip_end)
+
+            # Chat conversations [Started, Resolved] clipped to this shift window --
+            # needed BELOW (chat-backed presence) as well as further down (Occupancy).
+            agent_chat_ivs = chat_intervals.get(agent, [])
+            chat_clipped = [
+                (max(s, win_start), min(e, window_clip_end))
+                for s, e in agent_chat_ivs
+                if min(e, window_clip_end) > max(s, win_start)
+            ]
+
+            # Fill Offline gaps with real, evidenced chat-handling time BEFORE the
+            # short-gap reclassification below -- see _fill_offline_with_chat.
+            # Confirmed Sep 2026, per Mahmoud: Sara Hussien 17-18 Aug and Muhammed
+            # Hesham 13 Aug both had multi-hour Agents Activity gaps that were
+            # actually full shifts of real chat work, not real absence.
+            clipped = _fill_offline_with_chat(clipped, chat_clipped, CHAT_BACKED_STATE)
+            chat_inferred_min = sum(
+                (e - s).total_seconds() / 60 for s, e, st in clipped if st == CHAT_BACKED_STATE
+            )
+
+            # Reclassify short Offline gaps sandwiched between identical break/
+            # coaching/training states (e.g. a brief reconnect blip mid-break).
+            # Capped at RECLASS_MAX_GAP_MINUTES -- Sep 2026, per Mahmoud, after a
+            # real case (Muhammed Hesham, 13 Aug) bridged a ~5-hour Offline gap
+            # into "Away - coaching" purely because a few-second coaching blip
+            # happened to sit on each side of it. That gap is now mostly covered
+            # by the chat fill above; this cap guards whatever's left.
             for i in range(1, len(clipped) - 1):
                 if clipped[i][2] == OFFLINE_STATE:
                     prev_s, next_s = clipped[i - 1][2], clipped[i + 1][2]
-                    if prev_s == next_s and prev_s in RECLASS_STATES:
+                    gap_min = (clipped[i][1] - clipped[i][0]).total_seconds() / 60
+                    if prev_s == next_s and prev_s in RECLASS_STATES and gap_min <= RECLASS_MAX_GAP_MINUTES:
                         clipped[i][2] = prev_s
 
             def mins(states):
                 return sum((e - s).total_seconds() / 60 for s, e, st in clipped if st in states)
 
-            online_min = mins({'Available'})
+            online_min = mins({'Available', CHAT_BACKED_STATE})
             busy_min = mins({'Busy'})
             break_min = mins(BREAK_STATES)
             coaching_min = mins({COACHING_STATE})
@@ -765,19 +856,12 @@ def compute_adherence(data, start, end):
             tech_min = mins({TECH_STATE})
             actual = online_min + busy_min + coaching_min + training_min + tech_min
 
-            # Chat time that fell inside an "Available" stretch -- NOT inside
-            # "Busy", since that's already call time and would double-count.
-            # This is a reclassification within online_min, not extra minutes,
-            # so Actual Minutes above (which only cares about online vs. away)
-            # is unaffected.
-            avail_intervals = [(s, e) for s, e, st in clipped if st == 'Available']
-            window_clip_end = min(win_end + pd.Timedelta(hours=12), win_end + pd.Timedelta(hours=1))
-            agent_chat_ivs = chat_intervals.get(agent, [])
-            chat_clipped = [
-                (max(s, win_start), min(e, window_clip_end))
-                for s, e in agent_chat_ivs
-                if min(e, window_clip_end) > max(s, win_start)
-            ]
+            # Chat time that fell inside an "Available" (or chat-backed) stretch --
+            # NOT inside "Busy", since that's already call time and would
+            # double-count. This is a reclassification within online_min, not extra
+            # minutes, so Actual Minutes above is unaffected. A CHAT_BACKED_STATE
+            # segment is, by construction, 100% chat-covered already.
+            avail_intervals = [(s, e) for s, e, st in clipped if st in ('Available', CHAT_BACKED_STATE)]
             chat_occupied_min = _overlap_minutes(avail_intervals, chat_clipped)
 
             active = [iv for iv in clipped if iv[2] != OFFLINE_STATE]
@@ -793,6 +877,11 @@ def compute_adherence(data, start, end):
                 'Planned Minutes': planned, 'Actual Minutes': round(actual, 1),
                 'Online Minutes': round(online_min, 1), 'Busy Minutes': round(busy_min, 1),
                 'Chat Occupied Minutes': round(chat_occupied_min, 1),
+                # Of Online Minutes above, how much came from chat evidence filling an
+                # Agents Activity gap rather than a real Maqsam "Available" state --
+                # see _fill_offline_with_chat. 0 on a normal day; the whole point is
+                # this stays visible instead of silently blending into Online Minutes.
+                'Chat-Inferred Minutes': round(chat_inferred_min, 1),
                 'Break Minutes': round(break_min, 1), 'Coaching Minutes': round(coaching_min, 1),
                 'Training Minutes': round(training_min, 1), 'Technical Minutes': round(tech_min, 1),
                 'Late Minutes': round(late_min, 1), 'Early Logout Minutes': round(early_min, 1),
@@ -848,11 +937,16 @@ def compute_adherence(data, start, end):
             'Occupancy %': round(occupancy, 1) if pd.notna(occupancy) else None,
             'Shrinkage %': round(shrinkage, 1) if pd.notna(shrinkage) else None,
             'Incomplete Days': incomplete_n,
+            # Of Available Minutes above, how much is chat-evidenced fill rather than
+            # a real Maqsam login -- see the per-day column of the same name. A large
+            # number here is worth a manual look (agent not toggling Maqsam correctly,
+            # or a real presence-tracking gap), not proof of anything wrong on its own.
+            'Chat-Inferred Minutes': round(working.get('Chat-Inferred Minutes', pd.Series(dtype=float)).sum(), 0),
         })
     adherence_cols = ['Agent', 'Team', 'Working Days', 'Days Off', 'Planned Minutes', 'Actual Minutes',
                        'Adherence %', 'Late Minutes', 'Early Logout Minutes', 'Excuse Minutes',
                        'Available Minutes', 'Busy Minutes (Calls)', 'Chat Minutes', 'Occupancy %',
-                       'Shrinkage %', 'Incomplete Days']
+                       'Shrinkage %', 'Incomplete Days', 'Chat-Inferred Minutes']
     adherence_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=adherence_cols)
     return adherence_df, daily_df, unclassified_df
 
