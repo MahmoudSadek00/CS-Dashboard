@@ -10,12 +10,14 @@ Streamlit tool, adapted to:
     name column at all, only the numeric id)
   - the Bahrain team excluded entirely from scope (their real chat volume belongs to a
     separate BH support queue, not this report)
-  - WFH -> 9-hour shift rule simplified, per Mahmoud (Sep 2026): dropped the old
-    gender-inferred "female agents on 4 PM - 12 AM are always WFH" special case --
-    it had no real basis (nobody could say who decided it) and Mahmoud asked for it
-    gone. Now purely: whatever that day's "Is WFH" flag says (Yes/No, after the
-    existing Fri/Sat/Sun auto-WFH override below) decides the hours -- WFH = 9 hours,
-    not WFH = 8 hours -- for ANY of the three 8-hour-type shifts, not just 4 PM-12 AM
+  - WFH -> 9-hour shift rule: initially simplified (Sep 2026, per Mahmoud) to drop a
+    gender-inferred "female agents on 4 PM - 12 AM are always WFH" special case, for
+    lacking a clear basis -- then, Sep 15 2026, Mahmoud explicitly reinstated a version
+    of it (standing, every day, not just Fri/Sat/Sun) plus a second new standing rule:
+    the overnight 12 AM-9 AM shift is WFH for everyone. See MALE_AGENTS /
+    WFH_ALWAYS_SHIFT_ALL / WFH_ALWAYS_SHIFT_NON_MALE below for the exact current rules --
+    they combine with the Schedule's own "Is WFH" flag and the Fri/Sat/Sun override
+    (whichever fires first wins; multiple can apply to the same day).
   - the Agents Activity Timestamp column mixing plain-text and Excel-auto-converted
     datetime cells, which silently swaps day/month for the auto-converted ones unless
     corrected (fix_activity_ts)
@@ -138,6 +140,20 @@ EIGHT_HOUR_TYPES = {'9 AM - 5 PM', '11 AM - 7 PM', '4 PM - 12 AM'}
 # Overridden' column) and surfaced in the Diagnostics tab, so a "No" in the raw sheet
 # being silently treated as WFH stays visible/auditable rather than a silent overwrite.
 WFH_OVERRIDE_WEEKDAYS = {'Friday', 'Saturday', 'Sunday'}
+
+# Sep 15 2026, per Mahmoud -- re-adds, on his explicit direct confirmation, a narrower
+# version of the "female agents on 4 PM-12 AM are always WFH" rule the module docstring
+# above says he had previously asked removed for lacking a clear basis. This time it's
+# a standing (every day, not just Fri/Sat/Sun) rule and Mahmoud named the exclusion list
+# himself rather than it being inferred from names -- MALE_AGENTS are the only agents
+# NOT covered by it; every other roster agent (incl. Waad Yassin, confirmed explicitly)
+# on a 4 PM-12 AM shift is WFH. He also named a second, gender-independent standing rule
+# in the same breath: the overnight 12 AM-9 AM shift is WFH for EVERYONE, always -- this
+# one doesn't change Planned Minutes (that shift is already 480 via SHIFT_PLANNED_MIN,
+# not one of EIGHT_HOUR_TYPES), it only makes the WFH flag/tracking accurate.
+MALE_AGENTS = {'Ahmed Ashraf', 'Ramy Maher', 'Hassan Badawy', 'Muhammed Hesham', 'Mohamed Sayed'}
+WFH_ALWAYS_SHIFT_ALL = {'12 AM - 9 AM'}
+WFH_ALWAYS_SHIFT_NON_MALE = {'4 PM - 12 AM'}
 
 BREAK_STATES = {'Away - short break', 'Away - lunch break', 'Away - gomaa prayer'}
 COACHING_STATE = 'Away - coaching'
@@ -416,6 +432,29 @@ def build_roster(agents, schedule, calls, chats, activity):
     else:
         schedule['is_wfh_flag'] = False
 
+    # Excuse Minutes / Note, added Sep 15 2026 per Mahmoud -- two columns he asked to sit
+    # directly on Schedule, next to Is WFH: a manager-approved excuse/lost-time number in
+    # minutes for that agent+day, plus a plain-text reason. Opportunistic like Is WFH
+    # above -- older Schedule exports without these columns just get 0/blank, no crash.
+    # Per the methodology already established for this (Aug 2026 manual reconciliation,
+    # reused directly rather than re-derived): approved excuse minutes REDUCE that day's
+    # Planned Minutes -- see compute_adherence() below. A blank/non-numeric cell reads as
+    # 0 (no excuse that day), never NaN, so it can't silently poison a sum.
+    if 'Excuse Minutes' in schedule.columns:
+        schedule['excuse_minutes'] = pd.to_numeric(schedule['Excuse Minutes'], errors='coerce').fillna(0.0)
+    else:
+        schedule['excuse_minutes'] = 0.0
+    if 'Note' in schedule.columns:
+        # fillna('') BEFORE astype(str) -- with pandas' newer string dtype, a NaN cell
+        # converted via .astype(str) can come back as an actual missing value again
+        # rather than the literal text "nan", which then slips past the isin() cleanup
+        # below and reappears downstream (str(NaN) == "nan") as a bogus "nan" note on
+        # every ordinary no-excuse day. Filling first sidesteps that regardless of dtype.
+        schedule['excuse_note'] = schedule['Note'].fillna('').astype(str).str.strip()
+        schedule.loc[schedule['excuse_note'].isin(['None', 'nan', 'NaN', '<NA>']), 'excuse_note'] = ''
+    else:
+        schedule['excuse_note'] = ''
+
     alias_lookup = {}
     for canon, al in ALIASES.items():
         for a in al:
@@ -660,6 +699,7 @@ def compute_adherence(data, start, end):
                     'Working Day': False, 'Planned Minutes': 0, 'Actual Minutes': 0,
                     'Late Minutes': 0, 'Early Logout Minutes': 0, 'Break Minutes': 0,
                     'Data Status': 'Complete', 'WFH Overridden': False,
+                    'Excuse Minutes': 0, 'Excuse Note': '',
                 })
                 continue
 
@@ -667,6 +707,16 @@ def compute_adherence(data, start, end):
             # for a genuine working shift (Day Off/leave already excluded above).
             wfh_overridden = False
             if not is_wfh and day_dt.day_name() in WFH_OVERRIDE_WEEKDAYS:
+                is_wfh = True
+                wfh_overridden = True
+            # Standing shift-based WFH overrides, per Mahmoud (Sep 15 2026) -- see
+            # MALE_AGENTS / WFH_ALWAYS_SHIFT_* above. Independent of the weekday
+            # override above (either can flip it; wfh_overridden just records that
+            # SOME override fired when the raw sheet said No).
+            if not is_wfh and shift_label in WFH_ALWAYS_SHIFT_ALL:
+                is_wfh = True
+                wfh_overridden = True
+            if not is_wfh and shift_label in WFH_ALWAYS_SHIFT_NON_MALE and agent not in MALE_AGENTS:
                 is_wfh = True
                 wfh_overridden = True
 
@@ -682,6 +732,18 @@ def compute_adherence(data, start, end):
                 nine_hour = True
                 win_end = win_end + pd.Timedelta(hours=1)
                 planned = 480
+
+            # Excuse Minutes, per Mahmoud (Sep 15 2026) -- an approved excuse for this
+            # agent+day reduces their obligation for the day, same methodology already
+            # reconciled manually for Aug 2026 (reused directly, not re-derived): approved
+            # excuses reduce PLANNED minutes, they are not added to Actual. Floored at 0 so
+            # a bad/oversized manual entry can't flip Planned negative. This intentionally
+            # runs AFTER the WFH nine_hour bump above, so an excuse on a WFH day reduces
+            # from 480, not from the un-bumped 420/8-hour figure.
+            excuse_min = float(srow.get('excuse_minutes', 0.0) or 0.0)
+            _raw_note = srow.get('excuse_note', '')
+            excuse_note = '' if pd.isna(_raw_note) else str(_raw_note).strip()
+            planned = max(0.0, planned - excuse_min)
 
             data_status = 'Complete' if win_end <= cutoff else 'Incomplete*'
             clipped = clip(intervals, win_start, min(win_end + pd.Timedelta(hours=12), win_end + pd.Timedelta(hours=1)))
@@ -734,6 +796,7 @@ def compute_adherence(data, start, end):
                 'Break Minutes': round(break_min, 1), 'Coaching Minutes': round(coaching_min, 1),
                 'Training Minutes': round(training_min, 1), 'Technical Minutes': round(tech_min, 1),
                 'Late Minutes': round(late_min, 1), 'Early Logout Minutes': round(early_min, 1),
+                'Excuse Minutes': round(excuse_min, 1), 'Excuse Note': excuse_note,
                 'Data Status': data_status,
             })
 
@@ -770,6 +833,10 @@ def compute_adherence(data, start, end):
             'Adherence %': round(adherence_pct, 1) if pd.notna(adherence_pct) else None,
             'Late Minutes': round(complete['Late Minutes'].sum(), 0),
             'Early Logout Minutes': round(complete['Early Logout Minutes'].sum(), 0),
+            # Total approved-excuse minutes this period, already subtracted out of
+            # Planned Minutes above (Sep 15 2026, per Mahmoud) -- shown here too so the
+            # size of that adjustment stays visible next to the number it changed.
+            'Excuse Minutes': round(working['Excuse Minutes'].sum(), 0),
             # The raw components behind Occupancy % (now (Busy + Chat) / (Available +
             # Busy), not just call-Busy -- per Mahmoud (Sep 2026), Busy only fires for
             # calls, so an agent who's mostly on chats read as "Available" nearly all
@@ -783,8 +850,9 @@ def compute_adherence(data, start, end):
             'Incomplete Days': incomplete_n,
         })
     adherence_cols = ['Agent', 'Team', 'Working Days', 'Days Off', 'Planned Minutes', 'Actual Minutes',
-                       'Adherence %', 'Late Minutes', 'Early Logout Minutes', 'Available Minutes',
-                       'Busy Minutes (Calls)', 'Chat Minutes', 'Occupancy %', 'Shrinkage %', 'Incomplete Days']
+                       'Adherence %', 'Late Minutes', 'Early Logout Minutes', 'Excuse Minutes',
+                       'Available Minutes', 'Busy Minutes (Calls)', 'Chat Minutes', 'Occupancy %',
+                       'Shrinkage %', 'Incomplete Days']
     adherence_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=adherence_cols)
     return adherence_df, daily_df, unclassified_df
 
