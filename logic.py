@@ -29,6 +29,16 @@ Streamlit tool, adapted to:
     a single Answered/Missed number, so the underlying cause stays visible per agent
   - FCR = no return contact from the same customer (Contact ID) within 7 days of a
     resolved chat's close time
+  - Adherence %, REDESIGNED Sep 19 2026 per Mahmoud: after the chat-backed-fill fix
+    below started routinely pushing Actual Minutes past Planned Minutes for almost
+    every agent (traced to conversations left open for hours/days being credited
+    as full continuous presence), Adherence was rebuilt to the plain WFM-standard
+    definition -- (actual login time -> actual logout time), clipped to the
+    scheduled window, as a share of Planned Minutes -- instead of summed Actual
+    Minutes / Planned Minutes. Whether the agent was actually busy vs. idle DURING
+    that clipped span is deliberately left to Occupancy % (a separate, existing
+    metric) rather than re-checked inside Adherence too. See CHAT_MIN_PER_MESSAGE /
+    CHAT_MAX_CREDIT_MINUTES and the 'Adherent Minutes' comment in compute_adherence.
 """
 import datetime as dt
 import io
@@ -59,6 +69,9 @@ CHATS_COLS_USED = [
     'DateTime Conversation Started', 'DateTime Conversation Resolved', 'Contact ID',
     'Assignee', 'First Response Time', 'Resolution Time', 'Conversation Category',
     'First Assignment to First Response Time',
+    # Sep 19 2026, per Mahmoud -- needed for the chat-backed-presence credit cap
+    # (see CHAT_MIN_PER_MESSAGE / CHAT_MAX_CREDIT_MINUTES below).
+    'Number of Incoming Messages', 'Number of Outgoing Messages',
 ]
 
 
@@ -85,7 +98,14 @@ ALIASES = {
     'Mayar Khaled': ['mayar khaled'],
     'Nada Esaam': ['nada esaam'],
     'Duha Younis': ['duha younis'],
-    'Hagar Ahmed': ['hagar ahmed'],
+    # 'Hagar Shaban' merged in here Sep 19 2026, per Mahmoud (direct confirmation) --
+    # Schedule's "Hagar Shaban" and Agents-ID's "Hagar Ahmed" are the SAME person, not
+    # two different agents. Previously kept deliberately separate (see the old comment
+    # this replaced) because that was an open, unconfirmed question -- while separate,
+    # Schedule rows under "Hagar Shaban" had no Agent ID to match against, so Chats
+    # could never be attributed to her at all (Assignee is ID-based only) and her
+    # Occupancy % read as near-zero for that reason alone, not real idle time.
+    'Hagar Ahmed': ['hagar ahmed', 'hagar shaban'],
     'Nada Sayed': ['nada sayed'],
     'Karim Mohamed': ['karim mohamed'],
     'Ramy Maher': ['ramy maher'],
@@ -100,9 +120,6 @@ ALIASES = {
     'Basma Mostafa': ['basma mostafa'],
     'Sara Hussien': ['sara hussien', 'sara hussein'],
     'Samaa Ahmed': ['samaa ahmed', 'sama ahmed'],
-    # Open question (flagged, not merged): Schedule's "Hagar Shaban" reads as a DIFFERENT
-    # person from Agents-ID's "Hagar Ahmed" -- kept separate here on purpose.
-    'Hagar Shaban': ['hagar shaban'],
 }
 
 # Schedule's "Employee name" (full/formal name) -> canonical Agents-ID name
@@ -110,7 +127,10 @@ SCHEDULE_NAME_MAP = {
     'Waad Alla El-dein Elsayed Mohamed': 'Waad Yassin',
     'Nariman Ezzat Amin Nagdy': 'Nariman Shedid',
     'Nayira Emad Hamdy Abu-Nar': 'Naira Emad',
-    'Hagar Shaban': 'Hagar Shaban',
+    # 'Hagar Shaban' -> 'Hagar Ahmed', confirmed Sep 19 2026 per Mahmoud -- same person
+    # (see the ALIASES comment above); this is what actually pulls her Schedule rows
+    # onto her real Agents-ID identity/Agent ID, not the alias list alone.
+    'Hagar Shaban': 'Hagar Ahmed',
     'Ahmed Ashraf': 'Ahmed Ashraf',
     'Ramy Maher': 'Ramy Maher',
     'Sara Hussien': 'Sara Hussien',
@@ -182,6 +202,23 @@ RECLASS_MAX_GAP_MINUTES = 90
 # folded into it at the source) so the daily/agent breakdown can still show how
 # many minutes came from genuine Maqsam presence vs. this fallback.
 CHAT_BACKED_STATE = 'Available (Chat, no Maqsam)'
+# Sep 19 2026, per Mahmoud -- a conversation's [Started, Resolved] span is NOT the
+# same thing as continuous agent work: a chat can sit open for hours (even days)
+# waiting on a slow customer reply, or simply forgotten, with almost no messages
+# in it. Confirmed on real Aug 2026 data (Nariman Shedid, 19 Jul: an entire 9-hour
+# overnight shift's Offline gap was covered by ONE conversation that stayed open
+# 25+ hours with only 3 messages total in it; 26 Jul: a second gap covered by one
+# conversation open 40+ hours with 27 messages). Message count vs. duration across
+# the whole dataset showed no real relationship past ~1 hour (a 4-24h-open chat
+# averaged the same ~4-5 messages as a 15-60min one) -- confirming the extra open
+# time is mostly silence, not extra work. So each conversation's credited presence
+# window is capped at CHAT_MIN_PER_MESSAGE minutes per message (incoming +
+# outgoing), up to CHAT_MAX_CREDIT_MINUTES total, anchored at the conversation's
+# own start -- never at more than its own real [Started, Resolved] span either.
+# This is a data-cleaning proxy for "evidence some work happened", not a claim
+# that the agent worked continuously for exactly that many minutes.
+CHAT_MIN_PER_MESSAGE = 10
+CHAT_MAX_CREDIT_MINUTES = 60
 
 # Serviced and Successful merged into one "Serviced" bucket, per Mahmoud (Sep 2026) --
 # the platform's own docs draw no real distinction Ops needs to track separately.
@@ -441,11 +478,12 @@ def build_roster(agents, schedule, calls, chats, activity):
     id_to_name = dict(zip(agents['Agent ID'], agents['Agent Name']))
     roster = agents['Agent Name'].tolist()
 
-    # add off-roster-but-scheduled people (e.g. "Hagar Shaban") AND anyone on the
-    # Agents ID tab with a blank Agent ID, so Schedule/Calls/Activity data isn't
-    # silently dropped just because they have no Agent ID yet -- Chats can't be
-    # attributed to them though (Assignee is ID-based), which is why they're flagged
-    # separately (agents_missing_id) rather than treated as fully resolved.
+    # add off-roster-but-scheduled people AND anyone on the Agents ID tab with a
+    # blank Agent ID, so Schedule/Calls/Activity data isn't silently dropped just
+    # because they have no Agent ID yet -- Chats can't be attributed to them though
+    # (Assignee is ID-based), which is why they're flagged separately
+    # (agents_missing_id) rather than treated as fully resolved. ("Hagar Shaban" used
+    # to be the standing example here -- no longer applies, see SCHEDULE_NAME_MAP.)
     sched_names = set(SCHEDULE_NAME_MAP.values())
     off_roster = sorted((sched_names - set(roster)) | set(agents_missing_id))
     full_roster = roster + off_roster
@@ -483,6 +521,17 @@ def build_roster(agents, schedule, calls, chats, activity):
     for col in ('First Response Time', 'Resolution Time', 'First Assignment to First Response Time'):
         if col in chats.columns:
             chats[col + ' (td)'] = chats[col].map(to_timedelta)
+    # Message counts, added Sep 19 2026 per Mahmoud -- the activity proxy behind the
+    # chat-backed-presence credit cap (see CHAT_MIN_PER_MESSAGE / CHAT_MAX_CREDIT_MINUTES
+    # and compute_adherence's chat_intervals below). Opportunistic like the columns
+    # above: missing on an older export just reads as 0 messages, so those conversations
+    # simply credit no presence (a total absence of a proxy signal, not proof of no work,
+    # but the safer default given no other evidence is available).
+    for col in ('Number of Incoming Messages', 'Number of Outgoing Messages'):
+        if col in chats.columns:
+            chats[col] = pd.to_numeric(chats[col], errors='coerce').fillna(0)
+        else:
+            chats[col] = 0
 
     activity = activity.copy()
     activity['Agent_n'] = activity['Agent Name'].map(norm)
@@ -752,16 +801,30 @@ def compute_adherence(data, start, end):
     # all day still reads as "Available" and Occupancy comes out implausibly low.
     # Approximated as [DateTime Conversation Started, DateTime Conversation
     # Resolved] per conversation assigned to the agent -- the closest thing to an
-    # "I was handling this" window the Chats export actually has. Two conversations
-    # worked at once are merged into one stretch first so simultaneous chats don't
-    # double-count.
+    # "I was handling this" window the Chats export actually has -- but capped per
+    # conversation (see CHAT_MIN_PER_MESSAGE / CHAT_MAX_CREDIT_MINUTES above): a
+    # conversation only credits min(its own real duration, messages * 10 min, 60
+    # min), anchored at its own start, since a long-open conversation is not proof
+    # of continuous work the whole time it stayed open. This feeds BOTH the
+    # chat-backed Offline fill below and Occupancy's Chat Occupied Minutes, so
+    # fixing it here cleans both at once. Two conversations worked at once (or
+    # whose capped credit windows overlap) are merged into one stretch first so
+    # simultaneous/overlapping chats don't double-count.
     chat_intervals = {}
     chats_scoped = chats[chats['canonical'].isin(roster)]
     for agent, grp in chats_scoped.groupby('canonical'):
-        ivs = [
-            (s, e) for s, e in zip(grp['DateTime Conversation Started'], grp['DateTime Conversation Resolved'])
-            if pd.notna(s) and pd.notna(e) and e > s
-        ]
+        ivs = []
+        for s, e, n_in, n_out in zip(
+            grp['DateTime Conversation Started'], grp['DateTime Conversation Resolved'],
+            grp['Number of Incoming Messages'], grp['Number of Outgoing Messages'],
+        ):
+            if pd.isna(s) or pd.isna(e) or e <= s:
+                continue
+            n_msgs = (n_in or 0) + (n_out or 0)
+            cap_min = min(n_msgs * CHAT_MIN_PER_MESSAGE, CHAT_MAX_CREDIT_MINUTES)
+            credited_end = min(e, s + pd.Timedelta(minutes=cap_min))
+            if credited_end > s:
+                ivs.append((s, credited_end))
         chat_intervals[agent] = _merge_intervals(ivs)
 
     def clip(intervals, ws, we):
@@ -793,6 +856,7 @@ def compute_adherence(data, start, end):
                 daily_rows.append({
                     'Agent': agent, 'Date': day_dt, 'Shift': shift_label,
                     'Working Day': False, 'Planned Minutes': 0, 'Actual Minutes': 0,
+                    'Adherent Minutes': 0, 'Scheduled Minutes': 0,
                     'Late Minutes': 0, 'Early Logout Minutes': 0, 'Break Minutes': 0,
                     'Data Status': 'Complete', 'WFH Overridden': False,
                     'Excuse Minutes': 0, 'Excuse Note': '',
@@ -852,6 +916,22 @@ def compute_adherence(data, start, end):
             _raw_note = srow.get('excuse_note', '')
             excuse_note = '' if pd.isna(_raw_note) else str(_raw_note).strip()
             planned = max(0.0, planned - excuse_min)
+
+            # Scheduled Minutes, added Sep 19 2026 per Mahmoud -- the DENOMINATOR for the
+            # redesigned Adherence % (see 'Adherent Minutes' below), deliberately separate
+            # from Planned Minutes above. Planned Minutes has the standing 60-minute break
+            # already subtracted out (so Actual Minutes, which also excludes Break-state
+            # time, compares apples to apples against it for Shrinkage % etc.) -- but
+            # Adherent Minutes is a plain login-to-logout SPAN, which naturally includes
+            # any break time that happened in the middle of it. Comparing that span against
+            # the break-reduced Planned Minutes was mismatched by design (a fully-present,
+            # perfectly on-time agent would already read ~114%, capped at 100% for
+            # everyone) -- confirmed on real data (all 13 agents hit exactly 100.0%).
+            # Scheduled Minutes is the raw shift window span instead (win_end - win_start,
+            # already reflecting the WFH nine-hour bump above), reduced only by the same
+            # Excuse Minutes -- matching the plain textbook Adherence definition (Scheduled
+            # Shift Duration in minutes, no break subtracted either side).
+            scheduled_min = max(0.0, (win_end - win_start).total_seconds() / 60 - excuse_min)
 
             data_status = 'Complete' if win_end <= cutoff else 'Incomplete*'
             window_clip_end = min(win_end + pd.Timedelta(hours=12), win_end + pd.Timedelta(hours=1))
@@ -915,11 +995,36 @@ def compute_adherence(data, start, end):
             late_min = max(0, (login - win_start).total_seconds() / 60) if login else planned
             early_min = max(0, (win_end - logout).total_seconds() / 60) if logout else planned
 
+            # Adherence, REDESIGNED Sep 19 2026 per Mahmoud -- no longer Actual
+            # Minutes / Planned Minutes (that summed every state minute, including
+            # chat-backed fill and reclassified gaps, so it could -- and after the
+            # chat-fill fix, routinely did -- exceed Planned, making Adherence
+            # meaningless for most agents). Adherence is now the plain WFM-standard
+            # definition: how much of the scheduled window falls between actual
+            # login and actual logout, clipped to the window itself so arriving
+            # early or leaving late (overtime) earns no extra credit. It deliberately
+            # does NOT re-check what state the agent was in minute-by-minute inside
+            # that span (Break vs Available etc.) -- that's already Occupancy's job
+            # (see 'Occupancy %' below), and doubling it into Adherence too was
+            # solving the same problem twice. login/logout above already come from
+            # the SAME clipped, chat-fill-capped intervals as everything else in
+            # this loop, so a stale open chat can no longer make a no-show day read
+            # as a full on-time shift (see CHAT_MIN_PER_MESSAGE above).
+            if login and logout:
+                adherent_min = max(0.0, (min(logout, win_end) - max(login, win_start)).total_seconds() / 60)
+            else:
+                adherent_min = 0.0
+
             daily_rows.append({
                 'Agent': agent, 'Date': day_dt, 'Shift': shift_label,
                 'Working Day': True, 'Nine Hour': nine_hour, 'Is WFH': is_wfh,
                 'WFH Overridden': wfh_overridden,
                 'Planned Minutes': planned, 'Actual Minutes': round(actual, 1),
+                # Login-to-logout span, clipped to the scheduled window -- see the
+                # comment above. This, not Actual Minutes, is what Adherence % is
+                # built from now, against Scheduled Minutes (not Planned Minutes).
+                'Adherent Minutes': round(adherent_min, 1),
+                'Scheduled Minutes': round(scheduled_min, 1),
                 'Online Minutes': round(online_min, 1), 'Busy Minutes': round(busy_min, 1),
                 'Chat Occupied Minutes': round(chat_occupied_min, 1),
                 # Of Online Minutes above, how much came from chat evidence filling an
@@ -947,6 +1052,8 @@ def compute_adherence(data, start, end):
         incomplete_n = int((working['Data Status'] == 'Incomplete*').sum())
         planned = working['Planned Minutes'].sum()
         actual = complete['Actual Minutes'].sum()
+        adherent = complete.get('Adherent Minutes', pd.Series(dtype=float)).sum()
+        scheduled = complete.get('Scheduled Minutes', pd.Series(dtype=float)).sum()
         online = complete.get('Online Minutes', pd.Series(dtype=float)).sum()
         busy = complete.get('Busy Minutes', pd.Series(dtype=float)).sum()
         chat_occ = complete.get('Chat Occupied Minutes', pd.Series(dtype=float)).sum()
@@ -959,11 +1066,25 @@ def compute_adherence(data, start, end):
                       + complete.get('Technical Minutes', pd.Series(dtype=float)).sum())
         planned_complete = complete['Planned Minutes'].sum()
         shrinkage = (shrink_min / planned_complete * 100) if planned_complete else np.nan
-        adherence_pct = min(100.0, actual / planned * 100) if planned else np.nan
+        # Adherence %, REDESIGNED Sep 19 2026 per Mahmoud -- Adherent Minutes (a
+        # login-to-logout span, clipped to the scheduled window) / Scheduled Minutes
+        # (the raw window span, not the break-reduced Planned Minutes -- see the
+        # 'Scheduled Minutes' comment in the loop above for why those two can't be
+        # mixed). The min(100, ...) below is doing real work, not just a formality:
+        # Adherent Minutes is clipped to the raw window (win_start/win_end), but
+        # Scheduled Minutes is that same window MINUS Excuse Minutes -- so on a day
+        # with an approved excuse where the agent stayed present anyway (e.g. Sara
+        # Hussien working through a Maqsam outage that was excused as Technical
+        # Issue), Adherent Minutes can legitimately be a few minutes more than
+        # Scheduled Minutes. That's the correct outcome (full credit, not >100%),
+        # not a bug -- confirmed on real Aug 2026 data, 22 such day-rows, all with
+        # a real Excuse Minutes entry behind them.
+        adherence_pct = min(100.0, adherent / scheduled * 100) if scheduled else np.nan
         rows.append({
             'Agent': agent, 'Team': TEAM_OVERRIDE.get(agent, 'CS'),
             'Working Days': int(len(working)), 'Days Off': int((~a['Working Day']).sum()),
             'Planned Minutes': round(planned, 0), 'Actual Minutes': round(actual, 0),
+            'Scheduled Minutes': round(scheduled, 0), 'Adherent Minutes': round(adherent, 0),
             'Adherence %': round(adherence_pct, 1) if pd.notna(adherence_pct) else None,
             'Late Minutes': round(complete['Late Minutes'].sum(), 0),
             'Early Logout Minutes': round(complete['Early Logout Minutes'].sum(), 0),
@@ -989,9 +1110,10 @@ def compute_adherence(data, start, end):
             'Chat-Inferred Minutes': round(working.get('Chat-Inferred Minutes', pd.Series(dtype=float)).sum(), 0),
         })
     adherence_cols = ['Agent', 'Team', 'Working Days', 'Days Off', 'Planned Minutes', 'Actual Minutes',
-                       'Adherence %', 'Late Minutes', 'Early Logout Minutes', 'Excuse Minutes',
-                       'Available Minutes', 'Busy Minutes (Calls)', 'Chat Minutes', 'Occupancy %',
-                       'Shrinkage %', 'Incomplete Days', 'Chat-Inferred Minutes']
+                       'Scheduled Minutes', 'Adherent Minutes', 'Adherence %', 'Late Minutes',
+                       'Early Logout Minutes', 'Excuse Minutes', 'Available Minutes',
+                       'Busy Minutes (Calls)', 'Chat Minutes', 'Occupancy %', 'Shrinkage %',
+                       'Incomplete Days', 'Chat-Inferred Minutes']
     adherence_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=adherence_cols)
     return adherence_df, daily_df, unclassified_df
 
