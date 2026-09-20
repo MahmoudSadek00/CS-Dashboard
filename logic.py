@@ -246,11 +246,6 @@ FCR_WINDOW_DAYS = 7
 CEO_TARGETS = {
     'answered_rate': {'red_max': 90.0, 'green_min': 95.0, 'stretch_min': 98.0},
     'fcr_rate': {'red_max': 80.0, 'green_min': 90.0, 'stretch_min': None},
-    # Scorecard gives a single $90-130 range rather than separate Red/Green/Stretch
-    # numbers, so this is a reasonable reading of it, not a value from the sheet:
-    # below $90 = red (missed even the floor), $90-129.99 = green (within range),
-    # $130+ = stretch (above the top of the range).
-    'aov_usd': {'red_max': 90.0, 'green_min': 90.0, 'stretch_min': 130.0},
 }
 
 TARGET_BADGES = {
@@ -259,6 +254,32 @@ TARGET_BADGES = {
     'amber': '🟡 Below CEO target',
     'red': '🔴 Below CEO red line',
 }
+
+# AOV per-market targets, REPLACED Sep 20 2026 per Mahmoud -- there used to be a flat
+# $90-130 'aov_usd' entry under CEO_TARGETS, my own guess at reading the scorecard's
+# summary text before Mahmoud shared the actual scorecard file. It was wrong on two
+# counts: the real target is a DIFFERENT Below/Target/Exceed band per market (scorecard
+# item 8, "Draft Order Sales (AOV per Agent, USD)"), not one number for everyone, and
+# Target/Exceed are the CEO's own forecast +20%/+30%, not a flat $90/$130. Values below
+# are copied directly from that sheet. Iraq is not covered by this KPI in the scorecard
+# at all -- deliberately absent, so an Iraq row reads as unbadged ('--') rather than
+# silently inheriting someone else's target. This can no longer be checked against the
+# blended per-agent AOV table below (one agent can sell across several markets with
+# different targets, so no single number is meaningful there) -- only against the
+# per-agent-PER-MARKET breakdown, see compute_aov_by_agent_market().
+AOV_MARKET_TARGETS = {
+    'SA':  {'red_max': 90.0,  'green_min': 108.0, 'stretch_min': 117.0},
+    'KW':  {'red_max': 100.0, 'green_min': 120.0, 'stretch_min': 130.0},
+    'QA':  {'red_max': 100.0, 'green_min': 120.0, 'stretch_min': 130.0},
+    'UAE': {'red_max': 80.0,  'green_min': 96.0,  'stretch_min': 104.0},
+    'OM':  {'red_max': 80.0,  'green_min': 96.0,  'stretch_min': 104.0},
+}
+
+# Below this many converted orders in a single Agent+Market cell, the average is too
+# noisy to badge against a target -- an agent with 1-2 orders in a market would read
+# as a flat "missed" or "hit" on what's really a coin flip. Chosen default, per
+# Mahmoud (Sep 20 2026) -- raise or lower freely.
+MIN_ORDERS_FOR_AOV_TARGET = 5
 
 
 def target_status(value, red_max, green_min, stretch_min=None):
@@ -282,6 +303,17 @@ def target_badge(value, key):
         return None
     status = target_status(value, cfg['red_max'], cfg['green_min'], cfg.get('stretch_min'))
     return TARGET_BADGES.get(status)
+
+
+def aov_market_badge(value, market, order_count):
+    """Like target_badge, but keyed by market (AOV_MARKET_TARGETS) instead of a single
+    CEO_TARGETS entry, and withheld ('--') below MIN_ORDERS_FOR_AOV_TARGET orders or
+    for a market the scorecard's AOV KPI doesn't cover at all (e.g. Iraq)."""
+    cfg = AOV_MARKET_TARGETS.get(str(market).strip().upper())
+    if not cfg or value is None or pd.isna(value) or order_count < MIN_ORDERS_FOR_AOV_TARGET:
+        return '—'
+    status = target_status(value, cfg['red_max'], cfg['green_min'], cfg.get('stretch_min'))
+    return TARGET_BADGES.get(status, '—')
 
 
 def norm(s):
@@ -1565,7 +1597,8 @@ def _add_bar_chart(ws, title, cat_col, val_col, first_data_row, last_data_row, a
     ws.add_chart(chart, f'A{anchor_row}')
 
 
-def export_excel(result, comparison=None, sections=None, aov_df=None, period_label=None, currency_note=None):
+def export_excel(result, comparison=None, sections=None, aov_df=None, aov_market_df=None,
+                  period_label=None, currency_note=None):
     sections = sections or ['Overall', 'Chats', 'Calls', 'Adherence']
     generated = dt.datetime.now().strftime('%Y-%m-%d %H:%M')
     subtitle = f"{period_label or ''}    |    Generated: {generated}".strip(' |')
@@ -1608,8 +1641,9 @@ def export_excel(result, comparison=None, sections=None, aov_df=None, period_lab
         if 'Adherence' in sections:
             _write_titled_sheet(writer, result['adherence'], 'Adherence', 'CS Dashboard -- Adherence per Agent',
                                  subtitle, pct_cols=_PCT_COLS_BY_SHEET['Adherence'])
-        if aov_df is not None and 'AOV' in sections:
+        if 'AOV' in sections and (aov_df is not None or aov_market_df is not None):
             aov_subtitle = subtitle + (f"    |    {currency_note}" if currency_note else '')
+        if aov_df is not None and 'AOV' in sections:
             ws3, hdr3, first3, last3 = _write_titled_sheet(
                 writer, aov_df, 'AOV per Agent', 'CS Dashboard -- AOV per Agent', aov_subtitle)
             value_col_name = 'Total Value (USD)' if 'Total Value (USD)' in aov_df.columns else 'Total Value'
@@ -1617,6 +1651,13 @@ def export_excel(result, comparison=None, sections=None, aov_df=None, period_lab
             _add_bar_chart(ws3, f'Total order value by agent ({value_col_name})', cat_col=1,
                             val_col=val_col_idx, first_data_row=first3, last_data_row=last3,
                             anchor_row=last3 + 3)
+        # Per-agent-per-market breakdown, added Sep 20 2026 per Mahmoud -- separate
+        # sheet, same 'AOV' export section, since it's the table that carries the
+        # (correct, per-market) 'vs AOV Target' badge -- see compute_aov_by_agent_market.
+        if aov_market_df is not None and not aov_market_df.empty and 'AOV' in sections:
+            _write_titled_sheet(
+                writer, aov_market_df, 'AOV per Agent per Market',
+                'CS Dashboard -- AOV per Agent per Market (vs CEO Target)', aov_subtitle)
         if comparison is not None and 'Comparison' in sections:
             _write_titled_sheet(writer, comparison['overall'], 'Comparison Overall',
                                  'CS Dashboard -- Comparison, Overall', subtitle)
@@ -1746,13 +1787,105 @@ def compute_aov_by_agent(orders_df, start, end, fx_rates=None):
             missing_markets = []
         grouped['AOV (USD)'] = grouped['AOV (USD)'].round(2)
         grouped['Total Value (USD)'] = grouped['Total Value (USD)'].round(2)
-        grouped['vs AOV Target'] = grouped['AOV (USD)'].map(
-            lambda v: (target_badge(v, 'aov_usd') or '—') if pd.notna(v) else '—'
-        )
+        # No 'vs AOV Target' badge here any more, REMOVED Sep 20 2026 per Mahmoud --
+        # this table is blended across every market an agent sold in (see the
+        # 'Markets' column), but the CEO scorecard's AOV target is set PER MARKET
+        # and varies up to 2x (UAE/OM $80 floor vs KW/QA/SA $90-100) -- no single
+        # number here could ever compare honestly. See compute_aov_by_agent_market()
+        # below for the per-agent-per-market breakdown that carries this badge.
 
     grouped['AOV'] = grouped['AOV'].round(2)
     grouped['Total Value'] = grouped['Total Value'].round(2)
     grouped = grouped.sort_values('Total Value', ascending=False).reset_index(drop=True)
+
+    diagnostic = None
+    if has_usd and unconverted_n:
+        diagnostic = (f"⚠️ {unconverted_n:,} order(s) in market(s) without a rate set "
+                       f"({', '.join(missing_markets)}) aren't included in the USD columns -- "
+                       f"add a rate for {'them' if len(missing_markets) > 1 else 'it'} in the sidebar to include them.")
+    return grouped, diagnostic
+
+
+# ---------------------------------------------------------------------------
+# AOV per agent, PER MARKET -- added Sep 20 2026 per Mahmoud. Same source/columns
+# as compute_aov_by_agent above, just grouped by [Agent, Market] instead of Agent
+# alone, so each cell can be checked against that market's own CEO target
+# (AOV_MARKET_TARGETS) rather than one blended number that can't be right for
+# every market an agent touches at once. See the 'vs AOV Target' removal note in
+# compute_aov_by_agent for the full reasoning.
+# ---------------------------------------------------------------------------
+def compute_aov_by_agent_market(orders_df, start, end, fx_rates=None):
+    """Returns (df, diagnostic), same None-with-explanation convention as
+    compute_aov_by_agent. Requires a market/country column (compute_aov_by_agent
+    doesn't) since that's the whole point of this table."""
+    if orders_df.empty:
+        return None, "The Orders tab came back empty."
+    columns = list(orders_df.columns)
+    salesman_col = 'Salesman' if 'Salesman' in columns else columns[-1]
+    date_col = _find_column(columns, AOV_DATE_CANDIDATES)
+    value_col = _find_column(columns, AOV_VALUE_CANDIDATES)
+    market_col = _find_column(columns, AOV_MARKET_CANDIDATES)
+    missing = [name for name, col in [('a date', date_col), ('an order-value', value_col)] if col is None]
+    if missing:
+        return None, (f"Couldn't confidently find {' or '.join(missing)} column. "
+                       f"Columns actually seen in the Orders tab: {columns}")
+    if market_col is None:
+        return None, "Couldn't confidently find a market/country column, so a per-market breakdown isn't possible."
+
+    work = orders_df.copy()
+    if work[date_col].map(lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)).any():
+        work[date_col] = work[date_col].map(_serial_to_ts)
+    else:
+        work[date_col] = pd.to_datetime(work[date_col], errors='coerce')
+    work[value_col] = pd.to_numeric(work[value_col], errors='coerce')
+
+    win = work[_in_range(work[date_col], start, end)]
+    salesman_norm = win[salesman_col].astype(str).str.strip()
+    agent_orders = win[~salesman_norm.str.lower().isin(NOT_AGENT_SALESMAN) & (salesman_norm != '') & win[value_col].notna()].copy()
+    if agent_orders.empty:
+        return pd.DataFrame(columns=['Agent', 'Market', 'Orders', 'AOV', 'Total Value']), None
+    agent_orders[market_col] = agent_orders[market_col].astype(str).str.strip().str.upper()
+
+    grouped = agent_orders.groupby([salesman_col, market_col])[value_col].agg(['count', 'mean', 'sum']).reset_index()
+    grouped = grouped.rename(columns={
+        salesman_col: 'Agent', market_col: 'Market', 'count': 'Orders', 'mean': 'AOV', 'sum': 'Total Value',
+    })
+    grouped['AOV'] = grouped['AOV'].round(2)
+    grouped['Total Value'] = grouped['Total Value'].round(2)
+
+    fx_rates = {str(k).strip().upper(): v for k, v in (fx_rates or {}).items() if v}
+    has_usd = bool(fx_rates)
+    unconverted_n = 0
+    missing_markets = []
+    if has_usd:
+        rate = agent_orders[market_col].map(fx_rates)
+        agent_orders['_usd_value'] = agent_orders[value_col] / rate
+        agent_orders['_unconverted'] = rate.isna()
+        converted = agent_orders[~agent_orders['_unconverted']]
+        if not converted.empty:
+            usd_agg = converted.groupby([salesman_col, market_col])['_usd_value'].agg(['count', 'mean', 'sum']).reset_index()
+            usd_agg = usd_agg.rename(columns={
+                salesman_col: 'Agent', market_col: 'Market',
+                'count': 'Orders (converted)', 'mean': 'AOV (USD)', 'sum': 'Total Value (USD)',
+            })
+            grouped = grouped.merge(usd_agg, on=['Agent', 'Market'], how='left')
+        else:
+            grouped['Orders (converted)'] = 0
+            grouped['AOV (USD)'] = np.nan
+            grouped['Total Value (USD)'] = np.nan
+        grouped['Orders (converted)'] = grouped['Orders (converted)'].fillna(0).astype(int)
+        grouped['AOV (USD)'] = grouped['AOV (USD)'].round(2)
+        grouped['Total Value (USD)'] = grouped['Total Value (USD)'].round(2)
+        grouped['vs AOV Target'] = grouped.apply(
+            lambda r: aov_market_badge(r['AOV (USD)'], r['Market'], r['Orders (converted)']), axis=1
+        )
+        unconverted_n = int(agent_orders['_unconverted'].sum())
+        if unconverted_n:
+            missing_markets = sorted(set(
+                agent_orders.loc[agent_orders['_unconverted'], market_col]
+            ) - {''})
+
+    grouped = grouped.sort_values(['Agent', 'Total Value'], ascending=[True, False]).reset_index(drop=True)
 
     diagnostic = None
     if has_usd and unconverted_n:
