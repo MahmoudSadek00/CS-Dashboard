@@ -288,12 +288,7 @@ c11.metric(
          "(Inbound + Outbound combined -- see the Inbound vs Outbound Calls section below "
          "for the two split out separately).",
 )
-c12.metric(
-    "Avg. Holding Time", overall['avg_holding_time'] or "--",
-    help="Average Holding Duration across every Serviced call in the period, company-wide "
-         "(Inbound + Outbound combined -- see the Inbound vs Outbound Calls section below "
-         "for the two split out separately). Added Sep 20 2026, per Mahmoud.",
-)
+c12.metric("Avg. Holding Time", overall['avg_holding_time'] or "--")
 
 st.subheader("Calls by state")
 state_totals = overall['call_state_totals']
