@@ -399,9 +399,15 @@ with st.sidebar:
 # a different sheet that may not be shared with the service account yet.
 # ---------------------------------------------------------------------------
 aov_df = aov_diag = aov_error = None
+aov_market_df = aov_market_diag = None
 try:
     orders_df = _cached_orders_df(gc, CLEAN_SHEET_ID, CLEAN_SHEET_ORDERS_TAB, st.session_state['cache_bump'])
     aov_df, aov_diag = logic.compute_aov_by_agent(orders_df, pd.Timestamp(start), pd.Timestamp(end), fx_rates=fx_rates)
+    # Per-agent-per-market breakdown, added Sep 20 2026 per Mahmoud -- same Orders
+    # data, just grouped finer, so this is the table that actually carries the
+    # 'vs AOV Target' badge (the blended table above no longer does -- see logic.py).
+    aov_market_df, aov_market_diag = logic.compute_aov_by_agent_market(
+        orders_df, pd.Timestamp(start), pd.Timestamp(end), fx_rates=fx_rates)
 except Exception as e:
     aov_error = (
         f"Couldn't read the Orders (Clean) sheet: {e}\n\nMost likely cause: the service "
@@ -433,6 +439,7 @@ with st.sidebar:
     export_bytes = logic.export_excel(
         result, comparison=comparison, sections=export_sections,
         aov_df=aov_df if 'AOV' in export_sections else None,
+        aov_market_df=aov_market_df if 'AOV' in export_sections else None,
         period_label=period_label, currency_note=currency_note,
     ) if export_sections else None
     st.download_button(
@@ -589,7 +596,7 @@ else:
             "⚠️ Currency is set to \"Original (as recorded)\" -- these AOV figures are shown "
             "in the Orders sheet's original currency, as-is, not converted to USD. Switch the "
             "**Currency** toggle in the sidebar to \"USD\" to compare against the CEO "
-            "scorecard's AOV target ($90-130, market-dependent).",
+            "scorecard's AOV target (see the per-market table below).",
             icon="⚠️",
         )
     else:
@@ -597,7 +604,9 @@ else:
             "AOV (USD) columns use the rate(s) set in the sidebar's **Currency** section "
             "(UAE + Oman via AED, Saudi + Kuwait + Qatar + Bahrain via BHD, Iraq via IQD). "
             "Orders in any other market stay out of those columns (shown in the "
-            "Orders/AOV/Total Value columns in local currency only)."
+            "Orders/AOV/Total Value columns in local currency only). This table is blended "
+            "across every market an agent sold in, so it has no 'vs AOV Target' column any "
+            "more -- the target itself varies by market (see below)."
         )
     if aov_diag:
         st.info(aov_diag)
@@ -607,6 +616,37 @@ else:
         col_config['AOV (USD)'] = st.column_config.NumberColumn(format="$%.2f")
         col_config['Total Value (USD)'] = st.column_config.NumberColumn(format="$%.2f")
     st.dataframe(aov_df_view, use_container_width=True, hide_index=True, column_config=col_config)
+
+# ---------------------------------------------------------------------------
+# AOV per agent, PER MARKET -- added Sep 20 2026 per Mahmoud, right after the
+# blended table above. The CEO scorecard's AOV target (Draft Order Sales, item 8)
+# is set per market and varies up to 2x, so this is the table that actually
+# carries the 'vs AOV Target' badge -- see AOV_MARKET_TARGETS in logic.py.
+# ---------------------------------------------------------------------------
+st.subheader("AOV per Agent per Market -- vs CEO Target")
+st.caption(
+    f"Same Orders (Clean) data as the table above, broken out by market so each cell "
+    f"can be checked against that market's own CEO target (Below / Target = forecast "
+    f"+20% / Exceed = forecast +30%). Iraq isn't covered by this KPI in the CEO "
+    f"scorecard, so it's shown with no badge. A cell with fewer than "
+    f"{logic.MIN_ORDERS_FOR_AOV_TARGET} converted orders also shows no badge -- too "
+    f"few orders to trust the average."
+)
+if aov_error:
+    pass  # already shown above
+elif aov_market_df is None:
+    st.caption(aov_market_diag or "Couldn't compute AOV per market for this period.")
+elif aov_market_df.empty:
+    st.caption("No agent-attributed orders matched the roster in this period.")
+else:
+    if aov_market_diag:
+        st.info(aov_market_diag)
+    aov_market_view = aov_market_df[aov_market_df['Agent'].isin(selected_agents)].reset_index(drop=True)
+    mkt_col_config = {'AOV': st.column_config.NumberColumn(format="%.2f")}
+    if 'AOV (USD)' in aov_market_view.columns:
+        mkt_col_config['AOV (USD)'] = st.column_config.NumberColumn(format="$%.2f")
+        mkt_col_config['Total Value (USD)'] = st.column_config.NumberColumn(format="$%.2f")
+    st.dataframe(aov_market_view, use_container_width=True, hide_index=True, column_config=mkt_col_config)
 
 # ---------------------------------------------------------------------------
 # Comparison -- Period A vs Period B, same concept as the Ops Pulse comparison
