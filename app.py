@@ -28,6 +28,16 @@ st.markdown("""
         font-weight: 500 !important;
         letter-spacing: .02em;
         text-transform: uppercase;
+        /* Sep 20 2026, per Mahmoud -- a metric with a long label (e.g. "Avg Handling
+           Time") packed into a narrow column (4-5 stMetric tiles across a HALF-width
+           block, like the Inbound/Outbound section below) was truncating to "Avg
+           Handli..." -- Streamlit's own default label style clips with an ellipsis
+           and this block never overrode it (only stMetricValue below did). Same
+           wrap-instead-of-clip treatment as the value now applies to the label too. */
+        white-space: normal !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        word-break: break-word;
     }
     div[data-testid="stMetric"] { min-width: 0; }
     div[data-testid="stMetricValue"] {
@@ -269,7 +279,7 @@ with c8:
             st.caption("Share of the combined Busy-calls + chat-handling minutes behind "
                        "the Occupancy % above (company-wide, this period).")
 
-c9, c10, c11, _c12 = st.columns(4)
+c9, c10, c11, c12 = st.columns(4)
 c9.metric("Avg. Shrinkage", _pct(overall['avg_shrinkage']))
 c10.metric("Agents in Scope", f"{overall['agents_in_scope']}")
 c11.metric(
@@ -277,6 +287,12 @@ c11.metric(
     help="Average Handling Duration across every Serviced call in the period, company-wide "
          "(Inbound + Outbound combined -- see the Inbound vs Outbound Calls section below "
          "for the two split out separately).",
+)
+c12.metric(
+    "Avg. Holding Time", overall['avg_holding_time'] or "--",
+    help="Average Holding Duration across every Serviced call in the period, company-wide "
+         "(Inbound + Outbound combined -- see the Inbound vs Outbound Calls section below "
+         "for the two split out separately). Added Sep 20 2026, per Mahmoud.",
 )
 
 st.subheader("Calls by state")
@@ -481,13 +497,21 @@ st.header("Calls -- Inbound vs Outbound")
 
 def _render_calls_direction_block(label, totals, df_view):
     st.subheader(label)
-    n1, n2, n3, n4 = st.columns(4)
+    # Sep 20 2026, per Mahmoud -- was 4 stMetric tiles crammed into ONE row inside a
+    # HALF-width column (this block sits in col_in/col_out below), so each tile only
+    # got ~1/8 of the page width -- "Avg Handling Time" truncated to "Avg Handli..."
+    # and its value to "00:0...". Split across two rows (3 + 2) instead, so each tile
+    # gets roughly the same width as the Overall cards above (which never truncated),
+    # and there's room for the new Avg Holding Time tile without re-cramming it.
+    n1, n2, n3 = st.columns(3)
     n1.metric("Total Calls", f"{totals['total_calls']:,}")
     n2.metric("Answered Rate", _pct(totals['answered_rate']))
     dropped_rate = (round(totals['state_totals']['Dropped'] / totals['total_calls'] * 100, 1)
                     if totals['total_calls'] else None)
     n3.metric("Dropped Rate", _pct(dropped_rate))
+    n4, n5 = st.columns(2)
     n4.metric("Avg Handling Time", totals['avg_handling_time'] or "--")
+    n5.metric("Avg Holding Time", totals['avg_holding_time'] or "--")
 
     state_totals = totals['state_totals']
     state_total_n = sum(state_totals.values())
