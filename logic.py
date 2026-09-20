@@ -64,7 +64,7 @@ GOOGLE_SHEETS_EPOCH = dt.date(1899, 12, 30)
 # tabs carry several wide free-text columns nothing here uses at all (Call Summary,
 # Closing Note Summary, and more) -- fetching those on every load was most of the actual
 # payload for no benefit.
-CALLS_COLS_USED = ['Agent', 'Created', 'State', 'Handling Duration', 'Type']
+CALLS_COLS_USED = ['Agent', 'Created', 'State', 'Handling Duration', 'Holding Duration', 'Type']
 CHATS_COLS_USED = [
     'DateTime Conversation Started', 'DateTime Conversation Resolved', 'Contact ID',
     'Assignee', 'First Response Time', 'Resolution Time', 'Conversation Category',
@@ -1223,6 +1223,15 @@ def compute_calls(data, start, end, denom_days, direction=None):
     if direction is not None:
         win = win[win['Direction'] == direction]
     win['handle_td'] = win['Handling Duration'].map(to_timedelta)
+    # Holding Duration, added Sep 20 2026 per Mahmoud -- how long an answered call sat on
+    # hold, same "opportunistic" treatment as elsewhere in this file: missing on an older
+    # export just reads as 0 holding time everywhere below, no crash. Averaged over the
+    # same Serviced-calls scope as Avg Handling Time (a call that was never answered has
+    # no real hold time to average in either).
+    if 'Holding Duration' in win.columns:
+        win['hold_td'] = win['Holding Duration'].map(to_timedelta)
+    else:
+        win['hold_td'] = pd.Timedelta(0)
     win_scoped = win[win['canonical'].isin(roster)].copy()
 
     rows = []
@@ -1235,16 +1244,18 @@ def compute_calls(data, start, end, denom_days, direction=None):
         answered = sum(state_counts[s] for s in CALL_ANSWERED_STATES)
         answered_calls = a[a['State'].isin(CALL_ANSWERED_STATES)]
         avg_handle = answered_calls['handle_td'].mean() if len(answered_calls) else pd.Timedelta(0)
+        avg_hold = answered_calls['hold_td'].mean() if len(answered_calls) else pd.Timedelta(0)
         days = denom_days.get(agent)
         row = {
             'Agent': agent, 'Team': TEAM_OVERRIDE.get(agent, 'CS'),
             'Total Calls': total, 'Answered %': round(answered / total * 100, 1) if total else None,
             'Avg per day': round(total / days, 2) if days else None,
-            'Avg Handling Time': fmt_td(avg_handle),
+            'Avg Handling Time': fmt_td(avg_handle), 'Avg Holding Time': fmt_td(avg_hold),
         }
         row.update(state_counts)
         rows.append(row)
-    calls_cols = ['Agent', 'Team', 'Total Calls', 'Answered %', 'Avg per day', 'Avg Handling Time'] + CALL_STATES
+    calls_cols = (['Agent', 'Team', 'Total Calls', 'Answered %', 'Avg per day',
+                    'Avg Handling Time', 'Avg Holding Time'] + CALL_STATES)
     calls_df = (pd.DataFrame(rows).sort_values('Total Calls', ascending=False).reset_index(drop=True)
                 if rows else pd.DataFrame(columns=calls_cols))
 
@@ -1266,14 +1277,18 @@ def compute_calls(data, start, end, denom_days, direction=None):
     # "every call in the period, not just the per-agent table" scope as the other
     # _all figures above, and the same averaged-over-Serviced-calls-only definition
     # already used per-agent (see 'Avg Handling Time' in the per-agent loop above).
+    # Avg Holding Time (added Sep 20 2026, per Mahmoud) computed the same way,
+    # alongside it -- see 'Avg Holding Time' in the per-agent loop above.
     answered_mask_all = win['State'].isin(CALL_ANSWERED_STATES)
     avg_handle_all = win.loc[answered_mask_all, 'handle_td'].mean() if answered_mask_all.any() else None
     aht_all = fmt_td(avg_handle_all) if avg_handle_all is not None else None
+    avg_hold_all = win.loc[answered_mask_all, 'hold_td'].mean() if answered_mask_all.any() else None
+    aholdt_all = fmt_td(avg_hold_all) if avg_hold_all is not None else None
 
     calls_totals = {
         'state_totals': state_totals_all, 'total_calls': total_calls_all,
         'answered_rate': answered_rate_all, 'unattributed_calls': unattributed,
-        'avg_handling_time': aht_all,
+        'avg_handling_time': aht_all, 'avg_holding_time': aholdt_all,
     }
     return calls_df, calls_totals
 
@@ -1296,7 +1311,9 @@ def compute_overall(chats_df, calls_df, calls_totals, adherence_df):
     o['unattributed_calls'] = calls_totals['unattributed_calls']
     # AHT card, added Sep 2026 per Mahmoud -- one company-wide number (not split by
     # Inbound/Outbound, unlike the Calls section below -- confirmed with Mahmoud).
+    # Avg Holding Time added Sep 20 2026, same scope/treatment.
     o['avg_handling_time'] = calls_totals.get('avg_handling_time')
+    o['avg_holding_time'] = calls_totals.get('avg_holding_time')
     state_totals = calls_totals['state_totals']
     o['dropped_rate'] = (round(state_totals['Dropped'] / o['total_calls'] * 100, 1)
                           if o['total_calls'] else None)
