@@ -1155,9 +1155,10 @@ def compute_adherence(data, start, end):
 # ---------------------------------------------------------------------------
 def compute_fcr(chats_win):
     """Per resolved conversation: FCR = the same Contact ID does not start another
-    conversation within FCR_WINDOW_DAYS after this one's resolution. Computed within the
-    loaded/filtered Chats data only (a contact's very next conversation might fall outside
-    the file's date range and won't be seen)."""
+    conversation within FCR_WINDOW_DAYS after this one's resolution. Computed only
+    within whatever slice of Chats is passed in -- see compute_chats below, which
+    passes a slice widened by FCR_WINDOW_DAYS past the report's end date so a repeat
+    contact just after the period closes is still caught."""
     resolved = chats_win[chats_win['DateTime Conversation Resolved'].notna()].copy()
     resolved = resolved.sort_values(['Contact ID', 'DateTime Conversation Started'])
     fcr_flags = []
@@ -1181,7 +1182,23 @@ def compute_chats(data, start, end, denom_days):
     roster = data['full_roster']
     win = chats[_in_range(chats['DateTime Conversation Started'], start, end)].copy()
     win_scoped = win[win['canonical'].isin(roster)].copy()
-    fcr_df = compute_fcr(win_scoped)
+
+    # FCR repeat-contact lookahead, added Sep 2026 per Mahmoud -- a conversation that
+    # resolves near the END of the report period needs to see a few days INTO the next
+    # period to correctly tell whether the same contact came back within
+    # FCR_WINDOW_DAYS. The Chats data is one continuously-appended sheet (see Raw
+    # Data Automation), so that lookahead data already exists in `chats` -- it just
+    # wasn't being looked at, because `win_scoped` (above) is cut off exactly at
+    # `end`. Fix: widen the slice fed to compute_fcr to [start, end + FCR_WINDOW_DAYS]
+    # so a repeat that starts just after `end` is caught, then trim the result back
+    # down to conversations that actually STARTED within [start, end] -- a
+    # lookahead-window conversation's own FCR status belongs to whichever period IT
+    # started in, not this one, so it must not leak into this period's rate.
+    fcr_lookahead_end = pd.Timestamp(end) + pd.Timedelta(days=FCR_WINDOW_DAYS)
+    fcr_lookahead_win = chats[_in_range(chats['DateTime Conversation Started'], start, fcr_lookahead_end)].copy()
+    fcr_lookahead_scoped = fcr_lookahead_win[fcr_lookahead_win['canonical'].isin(roster)].copy()
+    fcr_df_wide = compute_fcr(fcr_lookahead_scoped)
+    fcr_df = fcr_df_wide[_in_range(fcr_df_wide['DateTime Conversation Started'], start, end)]
 
     # Opportunistic richer KPIs -- only switch on if the live Chats tab actually has
     # these columns (see build_roster). Kept separate from the required columns so a
