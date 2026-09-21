@@ -250,13 +250,19 @@ c2.metric(
          "Badge shows this against the CEO Q3 2026 scorecard target (90%).",
 )
 c3.metric("Total Calls", f"{overall['total_calls']:,}")
-c4.metric(
-    "Calls Answered Rate", _pct(overall['answered_rate']),
-    delta=_badge_delta(overall['answered_rate'], 'answered_rate'), delta_color="off",
-    help="Serviced, as a share of ALL calls in the period -- including calls that never reached any agent "
-         "(e.g. Dropped), which is why this is computed against the full Calls tab rather than the per-agent table. "
-         "Badge shows this against the CEO Q3 2026 scorecard target (95%, stretch 98%).",
-)
+with c4:
+    st.metric(
+        "Calls Answered Rate (Inbound)", _pct(overall['answered_rate']),
+        delta=_badge_delta(overall['answered_rate'], 'answered_rate'), delta_color="off",
+        help="Inbound calls only -- Serviced as a share of every Inbound call in the period, including calls "
+             "that never reached any agent (e.g. Dropped). Outbound is excluded here on purpose: it is the agent "
+             "calling the customer, so 'unanswered' mostly means the customer didn't pick up, not that the agent "
+             "failed to respond -- a different rate, shown separately below. "
+             "Badge shows this against the CEO Q3 2026 scorecard target (95%, stretch 98%).",
+    )
+    if overall['answered_rate_outbound'] is not None:
+        st.caption(f"Outbound: {_pct(overall['answered_rate_outbound'])} -- see the Inbound vs Outbound "
+                   f"section below for the full breakdown.")
 
 c5, c6, c7, c8 = st.columns(4)
 c5.metric("Dropped Rate", _pct(overall['dropped_rate']), help="Dropped calls as a share of ALL calls in the period.")
