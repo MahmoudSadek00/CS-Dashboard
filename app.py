@@ -733,4 +733,3 @@ if agents_missing_id:
         "based. Fill in their Agent ID on the sheet to fix this. (This used to crash the whole app on "
         "load instead -- a blank Agent ID cell is now skipped rather than fatal.)"
     )
-    
