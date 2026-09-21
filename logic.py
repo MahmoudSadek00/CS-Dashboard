@@ -1260,7 +1260,8 @@ def compute_calls(data, start, end, denom_days, direction=None):
     # export just reads as 0 holding time everywhere below, no crash. Averaged over the
     # same Serviced-calls scope as Avg Handling Time (a call that was never answered has
     # no real hold time to average in either).
-    if 'Holding Duration' in win.columns:
+    has_hold_col = 'Holding Duration' in win.columns
+    if has_hold_col:
         win['hold_td'] = win['Holding Duration'].map(to_timedelta)
     else:
         win['hold_td'] = pd.Timedelta(0)
@@ -1275,8 +1276,19 @@ def compute_calls(data, start, end, denom_days, direction=None):
         state_counts = {s: int((a['State'] == s).sum()) for s in CALL_STATES}
         answered = sum(state_counts[s] for s in CALL_ANSWERED_STATES)
         answered_calls = a[a['State'].isin(CALL_ANSWERED_STATES)]
-        avg_handle = answered_calls['handle_td'].mean() if len(answered_calls) else pd.Timedelta(0)
-        avg_hold = answered_calls['hold_td'].mean() if len(answered_calls) else pd.Timedelta(0)
+        # Sep 21 2026, per Mahmoud -- both averaged over only the calls that actually
+        # have a value in the raw column (_mean_td_nonblank), not over every answered
+        # call. to_timedelta() maps a blank cell to Timedelta(0), which is fine for
+        # Handling Duration (always populated) but was silently wrecking Avg Holding
+        # Time: on real Maqsam exports only a handful of calls out of thousands ever
+        # get a Holding Duration value at all, so averaging blanks-as-0 in with them
+        # diluted the result to ~0 regardless of what the real hold times were --
+        # exactly the "always reads zero" symptom, and NOT a deployment issue as
+        # first assumed. Chats' First Response Time etc. already used this same
+        # nonblank-aware average; Calls never did.
+        avg_handle = _mean_td_nonblank(answered_calls, 'Handling Duration', 'handle_td')
+        avg_hold = (_mean_td_nonblank(answered_calls, 'Holding Duration', 'hold_td')
+                    if has_hold_col else pd.Timedelta(0))
         days = denom_days.get(agent)
         row = {
             'Agent': agent, 'Team': TEAM_OVERRIDE.get(agent, 'CS'),
@@ -1312,10 +1324,12 @@ def compute_calls(data, start, end, denom_days, direction=None):
     # Avg Holding Time (added Sep 20 2026, per Mahmoud) computed the same way,
     # alongside it -- see 'Avg Holding Time' in the per-agent loop above.
     answered_mask_all = win['State'].isin(CALL_ANSWERED_STATES)
-    avg_handle_all = win.loc[answered_mask_all, 'handle_td'].mean() if answered_mask_all.any() else None
-    aht_all = fmt_td(avg_handle_all) if avg_handle_all is not None else None
-    avg_hold_all = win.loc[answered_mask_all, 'hold_td'].mean() if answered_mask_all.any() else None
-    aholdt_all = fmt_td(avg_hold_all) if avg_hold_all is not None else None
+    answered_all_df = win.loc[answered_mask_all]
+    avg_handle_all = _mean_td_nonblank(answered_all_df, 'Handling Duration', 'handle_td')
+    aht_all = fmt_td(avg_handle_all)
+    avg_hold_all = (_mean_td_nonblank(answered_all_df, 'Holding Duration', 'hold_td')
+                    if has_hold_col else pd.NaT)
+    aholdt_all = fmt_td(avg_hold_all)
 
     calls_totals = {
         'state_totals': state_totals_all, 'total_calls': total_calls_all,
