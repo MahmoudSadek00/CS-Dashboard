@@ -1342,7 +1342,8 @@ def compute_calls(data, start, end, denom_days, direction=None):
 # ---------------------------------------------------------------------------
 # Overall roll-up (for the top metric cards)
 # ---------------------------------------------------------------------------
-def compute_overall(chats_df, calls_df, calls_totals, adherence_df):
+def compute_overall(chats_df, calls_df, calls_totals, adherence_df,
+                     calls_inbound_totals=None, calls_outbound_totals=None):
     o = {}
     o['total_chats_closed'] = int(chats_df['Closed'].sum()) if not chats_df.empty else 0
     o['total_chats_assigned'] = int(chats_df['Assigned'].sum()) if not chats_df.empty else 0
@@ -1352,7 +1353,25 @@ def compute_overall(chats_df, calls_df, calls_totals, adherence_df):
     # From calls_totals (the full period, unattributed calls included) rather than
     # summed off the per-agent table -- see the comment in compute_calls.
     o['total_calls'] = calls_totals['total_calls']
-    o['answered_rate'] = calls_totals['answered_rate']
+    # Calls Answered Rate, changed Sep 2026 per Mahmoud -- this headline card now
+    # reads Inbound only, not Inbound+Outbound blended. The CEO KR1 target ("answer
+    # the front door", 95%) describes customer-initiated calls; Outbound is the
+    # agent calling out, where "unanswered" mostly means the CUSTOMER didn't pick up,
+    # not that the agent failed to respond -- a structurally different rate (it was
+    # reading ~36-42% and dragging the blended number down to ~72-75%, well under
+    # target, while Inbound alone was already 96.7-98.6%, at/above the stretch band).
+    # Falls back to the combined total if Inbound totals aren't available (keeps this
+    # function safe to call the old way). Outbound's own rate is kept alongside for
+    # the card's caption -- see the Calls -- Inbound vs Outbound section for the full
+    # breakdown, which already had both split out separately.
+    if calls_inbound_totals is not None:
+        o['answered_rate'] = calls_inbound_totals['answered_rate']
+        o['answered_rate_inbound_calls'] = calls_inbound_totals['total_calls']
+    else:
+        o['answered_rate'] = calls_totals['answered_rate']
+        o['answered_rate_inbound_calls'] = None
+    o['answered_rate_outbound'] = (calls_outbound_totals['answered_rate']
+                                    if calls_outbound_totals is not None else None)
     o['call_state_totals'] = calls_totals['state_totals']
     o['unattributed_calls'] = calls_totals['unattributed_calls']
     # AHT card, added Sep 2026 per Mahmoud -- one company-wide number (not split by
@@ -1410,7 +1429,9 @@ def build_report_from_data(data, start, end):
     # calls_totals above which stay as-is for the existing Overall cards/chart.
     calls_inbound_df, calls_inbound_totals = compute_calls(data, start, end, denom_days, direction='Inbound')
     calls_outbound_df, calls_outbound_totals = compute_calls(data, start, end, denom_days, direction='Outbound')
-    overall = compute_overall(chats_df, calls_df, calls_totals, adherence_df)
+    overall = compute_overall(chats_df, calls_df, calls_totals, adherence_df,
+                               calls_inbound_totals=calls_inbound_totals,
+                               calls_outbound_totals=calls_outbound_totals)
     return {
         'data': data, 'overall': overall, 'chats': chats_df, 'calls': calls_df,
         'calls_inbound': calls_inbound_df, 'calls_inbound_totals': calls_inbound_totals,
@@ -1445,7 +1466,7 @@ OVERALL_COMPARISON_METRICS = [
     ('total_chats_closed', 'Chats Closed', 'count', True),
     ('fcr_rate', 'Chats FCR Rate', 'pp', True),
     ('total_calls', 'Total Calls', 'count', True),
-    ('answered_rate', 'Calls Answered Rate', 'pp', True),
+    ('answered_rate', 'Calls Answered Rate (Inbound)', 'pp', True),
     ('avg_adherence', 'Avg. Adherence', 'pp', True),
     ('avg_occupancy', 'Avg. Occupancy', 'pp', True),
     ('avg_shrinkage', 'Avg. Shrinkage', 'pp', False),
